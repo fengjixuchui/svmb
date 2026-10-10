@@ -6979,3 +6979,121 @@ r109 已证伪 CleanBits 竞态=冻结因果（根修构建仍冻）。本迁移
 11 项全绿：selftest/viewprobe（视图发布周期直接消费者）/npfprobe/probee2e
 （wiggle 路径）/policytest(T2)/[internal-research consumer]。N1 修复后全绿复验。
 
+## Rounds 127-132 (2026-10-01) — [internal-research item]
+
+Six internal research rounds between the public r126 state and the
+r133 mem_crypt release (capability selection, private-frame lifecycle
+hardening, and the publication tooling itself) are omitted from the
+public history. The infrastructure they hardened that r133 depends on
+(the per-process NPT view binding and the slot-overlay private-frame
+layer with its exit-generation release gate) ships as part of the
+public tree; see docs/MEM_CRYPT.md.
+
+## Round 133 (2026-10-10) — mem_crypt：进程内存块加解密（双帧分视 + 两阶段 seal + 视图同步契约）
+
+### 现象（目标）
+
+实现"进程内存块加解密"：目标进程自己读明文，其他一切观察者
+（readvm/物理扫描/他进程）读密文；dec/卸载无损复原。首轮实机暴露
+三连环：目标侧过渡窗口读到密文（ok=1 damaged=3 持续不自愈）、第二
+目标 enc 报 170（单绑定槽被死目标钉死）、ovlstat 报 50（产线门）。
+
+### 与参考的对比
+
+- Cr3Encrypt 式"切出回写加密"被否（崩溃窗口/一致性复杂度高一档）；
+  选 r128 overlay 双帧常驻（切入切出零数据变换）。
+- CR3-write 拦截闭合迁移窗口被否：r42/r48 实证全系统上下文切换税
+  饿死本 vhv（cr3_monitor.h 明载 known-hazard）。
+- r47 Route-A 哨兵被否：KTHREAD.State 写发生在 CR3 加载**之前**，exit
+  时看到的还是旧 CR3，闭合不了视图切换。
+
+### 修复尝试（三轮实机）
+
+| 轮 | 方案 | 结果 |
+|---|---|---|
+| 1 | 单阶段 enc（挂起→map→密文→resume） | readvm=密文 ✓；目标 ok=1 damaged=3 ✗（迁移窗口） |
+| 2 | 两阶段 + 退出代际门（r130 机制暴露为 OverlayArmGeneration）+ ctl 逐核 CPUID nudge | 门通过 ✓；签名不变 ✗（CR3-陈旧半边未闭合） |
+| 3 | U/S=0 base 视图陷阱（r32 无条件故障律=合成读陷阱）+ npf 第二 deny 槽 | 陷阱被内核自己的触碰者（working set/compression direct-map 走行）一秒内 FOREIGN-fault 解除 ✗✗（内核日志实证）；**方案否决** |
+
+最终架构 = 冻结 stage-1（目标挂起过闸，零缓存污染）+ 代际门 +
+seal 时 MmMapIoSpace 物理别名写密文 + **视图同步契约**：目标在块
+访问点取 intercepted CPUID（exit 即重发布 per-core ProcView）。
+配套：死绑定槽抢占（Cr3M4ArmProcessView 查活抢死）、失败路径清理
+dec、Frozen 账目（stage-1 挂起/seal 补 resume，dec/Deinit 对账）、
+卸载顺序铁律（回写明文在 freeNow 释放 overlay 之前）。
+
+### 关键决策回顾
+
+| 当时以为 | 实际 |
+|---|---|
+| 两阶段代际门可闭合目标侧窗口 | 只闭了 stale-TLB 半边；CR3-陈旧半边是 r120 模型固有（npt.h M4 prerequisite 早有记载） |
+| U/S=0 陷阱=万能读陷阱 | r32 律对内核自己也生效；working-set/compression 触碰即拆陷阱 |
+| 哨兵可做调度期视图同步 | State 写在 CR3 装载前，exit 看到旧 CR3 |
+| readvm 可验证卸载回写 | 新驱动实例种子表看不见旧实例 spawn 的 pid（err 31）；判据改为幸存目标自身自检（findstr 零 DAMAGED） |
+| e2e 单文件握手 | 残留 mcrypt_va.txt 递了死 pid（复用 pid 陷阱）；先删后读+立即消费 |
+
+### 验证（全绿）
+
+全周期（baseline 明文→enc sealed→readvm=密文 且 目标自检 4/4 明文→
+dec→readvm 复原→list 0）+ hold+卸载腿（块保持 sealed 下 sc stop/
+start，子进程穿越全程零坏字节）+ 离线自测 347/0（含 keystream 9 项）。
+ovlstat 50 为产线门拒 NPT_HOOK（披露性，软警告容忍）。
+
+### 律（新增）
+
+1. **视图同步点 = VM exit**：per-core NCr3 只在 exit 时重发布；无
+   exit 纪元迁移到陈旧核读到原帧。受保护目标在访问点取 intercepted
+   CPUID 是部署契约（结构性修复=per-core view selection，r134+ 候选）。
+2. **r32 无条件故障律不可当读陷阱用**：内核 direct-map 触碰者会拆掉
+   它（FOREIGN fault→r45 解析→陷阱永久失效）。
+3. 种子表只登记自身加载后创建的进程：跨驱动生命周期的 pid 对 readvm
+   不可见；跨卸载判定只能用幸存目标自身。
+4. 复用 pid 陷阱：握手/状态文件先删后读、读完即消费。
+5. npf deny 链第二槽（NpfSetDenyCallback2）作为通用缝保留（本轮
+   陷阱方案的遗产）。
+
+### TODO
+
+- r134+ 候选：per-core view selection（npt.h M4 prerequisite 的结构
+  性闭合，消灭同步契约）；RC4/ChaCha20 无损升级（接口已统一）。
+
+## Round 133b (2026-10-10) — mem_crypt 验收审查（子代理 REJECT）→ P0×2+P1×2+P2×2+P3×7 全清 → 双块回归全绿
+
+### 审查发现（子代理通读 r133 全部新增代码，对照 9 条设计契约）
+
+- **P0-1 多块卸载回写丢失**：MemCryptDeinit 逐块调
+  OverlayUnmapForPid(pid, freeNow=true)，而 freeNow 分支**无视 pid 清空
+  整张 overlay 表**（npt_hook_mgr.cpp:1928 实证）——第 1 块处理完全场，
+  第 2..N 块的私有明文帧已被释放，回写落空 = 明文永久丢失（key 只在
+  日志）。单块 e2e 全绿恰因只有 1 块。修复：两阶段——先对全部块回写
+  明文+解除冻结，再一次 OverlayUnmapForPid(0, true) 清场；套件改双块
+  形状（target 双页双 enc，卸载腿 findstr 零 DAMAGED = 回归钉死）。
+- **P0-2 dec 失败路径冻结账目错配**：失败保留记录但 Frozen 仍 1，重试
+  dec 多付一次 resume（解冻别人的挂起），且失败后改调 seal 会在"目标
+  实际已解冻"下写密文。修复：付掉 wasFrozen resume 的同时 ClearFrozen
+  落到真实记录（锁内）。
+- **P1-1 seal 代际快照 UAF**：SnapshotBlock 把 Snap 指针拷出锁外，与
+  退出清扫的 FreeBlockRecord 竞争。修复：门判定整体移入 g_blockLock
+  （OverlayGenerationPassed 是无锁 ForEachVcpu 走行，锁内合法）。
+- **P1-2 PsSuspendProcess 返回值被无视**：挂起失败仍记 Frozen=1 = 对
+  seal 说谎。修复：stage-1 挂起不可用/失败即拒绝 enc（冻结是承重的）。
+- **P2-1** hv 停止时 seal 会瞬间过门并裸写密文 → seal 加 IsRunning
+  守卫（dec 放行=恢复路径）；**P2-2/P2-3** 绑定槽语义（配置武装可抢
+  活 crypt 目标、dec 不解除保留）文档化入 MEM_CRYPT.md 约束节。
+- P3×7：npf 第二槽注释去陈旧、未用 extern 声明删、CryptRollback 死参
+  删（unmap 自带 NOT_FOUND 自卫）、target 注释、ctl GetLastError 移
+  HeapFree 前（errOut 出参）、bat 缺 SHA256（登记容忍）、e2e 遗留
+  cmd 形状（未触发）。
+
+### 验证（修复后全绿）
+
+双块全周期（enc×2→双页密文→自检 4/4 明文→dec×2→双页复原→list 0）+
+双块 hold + 卸载（零 DAMAGED）+ selftest 347/0。
+
+### 律（审查轮新增）
+
+1. **freeNow 语义陷阱**：OverlayUnmapForPid(pid, true) 的 pid 无效——
+   任何"逐块释放"的多块调用方都会踩死后续块；多块清理必须两阶段。
+2. 挂起账目必须在"保留记录"的失败路径上同步清标志（付账与记账原子）。
+3. 锁外借用记录内指针（快照拷贝）= 与无锁清扫的 UAF 面；门判定类
+   只读检查整体搬进锁内。

@@ -47,3 +47,6 @@ build/vmenv.bat
 # local test certs and debug screenshots never go public
 *.cer
 tests/*.png
+
+# local build experiment artifacts (maps / perf variants)
+build/logs/

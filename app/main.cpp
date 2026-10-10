@@ -2333,6 +2333,626 @@ static int CmdCr3PolicyTest()
     return ok ? 0 : 1;
 }
 
+// intercepted CPUID each. External interrupts never exit this guest
+// (r122b law - an IPI/DPC broadcast executes in guest context), so the
+// intercepted CPUID is the only in-guest event that forces the exit
+// each parked private frame's generation predicate waits for. The
+// exit consumes the pending TLB kick (TLB_CTL_FLUSH_ALL on the next
+// VMRUN), after which the stale GPA->PrivPa translation can never be
+// consulted again and the driver's reap frees the frame.
+static void OvlNudgeAllCores()
+{
+    ULONG_PTR processMask = 0, systemMask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &processMask,
+                                &systemMask))
+        return;
+    DWORD_PTR old = SetThreadAffinityMask(GetCurrentThread(),
+                                          (DWORD_PTR)processMask);
+    if (!old)
+        return;
+    for (ULONG_PTR core = 1; core; core <<= 1)
+    {
+        if (!(systemMask & core) || !(processMask & core))
+            continue;
+        if (SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)core))
+        {
+            int regs[4];
+            __cpuid(regs, 1);
+        }
+    }
+    SetThreadAffinityMask(GetCurrentThread(), old);
+}
+
+// crypt enc|dec|list (r133 mem_crypt - dual-frame block encrypt):
+//   crypt enc <pid> <va-hex> <size> <key-hex>   - target keeps plaintext,
+//                                                everyone else sees cipher
+//   crypt dec <pid> <va-hex>                    - restore plaintext+identity
+//   crypt list
+// enc runs the r133 two-phase dance: stage 1 (ARMED maps + gate snapshot),
+// per-core CPUID nudge, seal retries until the exit-generation gate
+// passes (~10s budget).
+static void OvlNudgeAllCores(); // r130 reap nudge (defined below)
+
+// nudge + seal retry loop (the r133 gate dance); 0 = sealed
+static DWORD CryptSealStaged(svmb_u32 pid, svmb_u64 va)
+{
+    // seal gate: every core needs ONE exit past the post-map snapshot.
+    // The nudge pins to each core in turn and takes one intercepted
+    // CPUID (the only in-guest event that forces exits here - the r130
+    // reap law); seal returns DEVICE_BUSY until the last core is past.
+    for (int i = 0; i < 50; ++i) // ~10s budget at 200ms cadence
+    {
+        OvlNudgeAllCores();
+        SVMB_CR3_CRYPT s = {};
+        s.Action = 3;
+        s.Pid = pid;
+        s.BaseVa = va;
+        if (Call(SVMB_IOCTL_CR3_CRYPT, &s, sizeof(s), &s, sizeof(s)))
+            return 0;
+        DWORD e = GetLastError();
+        if (e != ERROR_BUSY)
+            return e;
+        Sleep(200);
+    }
+    return ERROR_BUSY;
+}
+
+// full two-phase enc: stage 1 (ARMED maps + gate snapshot), then the
+// nudge+seal loop. 0 = sealed; otherwise the WIN32 error (block left
+// ARMED - dec undoes it).
+static DWORD CryptEncStaged(svmb_u32 pid, svmb_u64 va, svmb_u64 size,
+                            svmb_u64 key, unsigned long* pagesOut)
+{
+    SVMB_CR3_CRYPT c = {};
+    c.Action = 0;
+    c.Pid = pid;
+    c.BaseVa = va;
+    c.Size = size;
+    c.Key = key;
+    if (!Call(SVMB_IOCTL_CR3_CRYPT, &c, sizeof(c), &c, sizeof(c)))
+        return GetLastError();
+    if (pagesOut)
+        *pagesOut = (unsigned long)c.OutStatus;
+    return CryptSealStaged(pid, va);
+}
+
+static int CmdCrypt(const wchar_t* sub, const wchar_t* a1, const wchar_t* a2,
+                    const wchar_t* a3, const wchar_t* a4)
+{
+    if (!OpenDrv())
+        return 1;
+    SVMB_CR3_CRYPT c = {};
+    if (!_wcsicmp(sub, L"enc"))
+    {
+        if (!a1 || !a2 || !a3 || !a4)
+        {
+            printf("[!] usage: crypt enc <pid> <va-hex> <size> <key-hex>\n");
+            return 1;
+        }
+        c.Action = 0;
+        c.Pid = (svmb_u32)wcstoul(a1, nullptr, 0);
+        c.BaseVa = _wcstoui64(a2, nullptr, 16);
+        c.Size = _wcstoui64(a3, nullptr, 0); // base 10: page counts are small
+        c.Key = _wcstoui64(a4, nullptr, 16);
+        if (!c.Pid || !c.BaseVa || !c.Size || !c.Key || (c.Size & 0xFFF))
+        {
+            printf("[!] enc args: pid/va/size/key nonzero, size 4K multiple"
+                   " (<= %u pages)\n",
+                   (unsigned)SVMB_CRYPT_MAX_PAGES);
+            return 1;
+        }
+    }
+    else if (!_wcsicmp(sub, L"dec"))
+    {
+        if (!a1 || !a2)
+        {
+            printf("[!] usage: crypt dec <pid> <va-hex>\n");
+            return 1;
+        }
+        c.Action = 1;
+        c.Pid = (svmb_u32)wcstoul(a1, nullptr, 0);
+        c.BaseVa = _wcstoui64(a2, nullptr, 16);
+        if (!c.Pid || !c.BaseVa)
+        {
+            printf("[!] dec args: pid/va nonzero\n");
+            return 1;
+        }
+    }
+    else if (!_wcsicmp(sub, L"list"))
+    {
+        c.Action = 2;
+    }
+    else
+    {
+        printf("[!] usage: crypt enc|dec|list ...\n");
+        return 1;
+    }
+
+    if (!Call(SVMB_IOCTL_CR3_CRYPT, &c, sizeof(c), &c, sizeof(c)))
+    {
+        printf("[!] CR3_CRYPT %ls failed (err %lu)\n", sub, GetLastError());
+        return 1;
+    }
+    if (c.Action == 0)
+    {
+        // two-phase enc: stage 1 above, now nudge + seal to completion
+        unsigned long pages = (unsigned long)c.OutStatus;
+        DWORD e = CryptSealStaged(c.Pid, c.BaseVa);
+        if (e)
+        {
+            printf("[!] crypt enc seal failed (err %lu) - block left "
+                   "ARMED (dec to undo)\n",
+                   e);
+            return 1;
+        }
+        printf("[+] crypt enc ok: pages=%lu (sealed)\n", pages);
+        return 0;
+    }
+    if (c.Action == 2)
+    {
+        printf("[+] crypt blocks live: %lu\n", (unsigned long)c.OutStatus);
+        for (svmb_u32 i = 0; i < c.Count && i < SVMB_CRYPT_MAX_BLOCKS; ++i)
+            printf("  pid=%lu base=%llx size=%llx pages=%lu\n",
+                   (unsigned long)c.Blocks[i].Pid,
+                   (unsigned long long)c.Blocks[i].BaseVa,
+                   (unsigned long long)c.Blocks[i].Size,
+                   (unsigned long)c.Blocks[i].Pages);
+    }
+    else
+    {
+        printf("[+] crypt %ls ok: pages=%lu\n", sub,
+               (unsigned long)c.OutStatus);
+    }
+    return 0;
+}
+
+// ---- r133 crypte2e machinery -------------------------------------------
+
+static svmb_u8 CryptPatternByte(int i) { return (svmb_u8)(i * 31 + 7); }
+
+static bool PatternMatches16(const svmb_u8* p)
+{
+    for (int i = 0; i < 16; ++i)
+        if (p[i] != CryptPatternByte(i))
+            return false;
+    return true;
+}
+
+// readvm 16 bytes from (pid, va) - the operator's (original-frame) view.
+// Sets *errOut from inside (before HeapFree) so callers print the real
+// error (review P3-7: GetLastError across HeapFree is unreliable)
+static bool CryptReadVm16(svmb_u32 pid, svmb_u64 va, svmb_u8 out[16],
+                          DWORD* errOut = nullptr)
+{
+    SVMB_CR3_READVM* rv = (SVMB_CR3_READVM*)HeapAlloc(GetProcessHeap(), 0,
+                                                      sizeof(*rv) + 16);
+    if (!rv)
+    {
+        if (errOut)
+            *errOut = ERROR_NOT_ENOUGH_MEMORY;
+        return false;
+    }
+    memset(rv, 0, sizeof(*rv) + 16); // r89 law: user-mode touch first
+    rv->Pid = pid;
+    rv->Va = va;
+    rv->Size = 16;
+    BOOL ok = Call(SVMB_IOCTL_CR3_READVM, rv, sizeof(*rv) + 16,
+                   rv, sizeof(*rv) + 16);
+    if (errOut)
+        *errOut = ok ? ERROR_SUCCESS : GetLastError();
+    if (ok)
+        memcpy(out, (const void*)(rv + 1), 16);
+    HeapFree(GetProcessHeap(), 0, rv);
+    return ok != FALSE;
+}
+
+struct TargetProc
+{
+    HANDLE hProc;
+    HANDLE hOutRd; // our end of the child stdout pipe
+    unsigned long pid;
+    unsigned long long va;  // page 1
+    unsigned long long va2; // page 2 (the multi-block regression shape)
+    char buf[4096];
+    DWORD bufLen;
+};
+
+static bool SpawnMcryptTarget(TargetProc& t, bool stdoutToFile = false)
+{
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    if (stdoutToFile)
+    {
+        // hold mode: the child OUTLIVES this process - a pipe would break
+        // at our exit. Redirect to a file the unload leg inspects later.
+        wr = CreateFileW(L"mcrypt_hold_out.txt", GENERIC_WRITE,
+                         FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (wr == INVALID_HANDLE_VALUE)
+        {
+            printf("[!] hold-output file failed (err %lu)\n",
+                   GetLastError());
+            return false;
+        }
+    }
+    else if (!CreatePipe(&rd, &wr, &sa, 0))
+        return false;
+    if (rd)
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    PROCESS_INFORMATION pi = {};
+    // argv[0]-first law: the command line must lead with the program name
+    wchar_t cmd[64] = L"mcrypt_target.exe";
+    if (!CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        printf("[!] spawn mcrypt_target.exe failed (err %lu)\n",
+               GetLastError());
+        if (rd)
+            CloseHandle(rd);
+        CloseHandle(wr);
+        return false;
+    }
+    CloseHandle(wr); // our write end must close or reads never see data
+    CloseHandle(pi.hThread);
+    memset(&t, 0, sizeof(t));
+    t.hProc = pi.hProcess;
+    t.pid = pi.dwProcessId;
+    t.hOutRd = rd; // null in file mode (no pipe to read)
+    return true;
+}
+
+// one \n-terminated line from the child pipe, poll-bounded by timeoutMs
+static bool TargetGetLine(TargetProc& t, char* out, size_t outCap,
+                          DWORD timeoutMs)
+{
+    ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    for (;;)
+    {
+        char* nl = (char*)memchr(t.buf, '\n', t.bufLen);
+        if (nl)
+        {
+            size_t n = (size_t)(nl - t.buf);
+            if (n >= outCap)
+                n = outCap - 1;
+            memcpy(out, t.buf, n);
+            out[n] = 0;
+            size_t rest = t.bufLen - (size_t)(nl - t.buf) - 1;
+            memmove(t.buf, nl + 1, rest);
+            t.bufLen = (DWORD)rest;
+            return true;
+        }
+        DWORD avail = 0;
+        if (!PeekNamedPipe(t.hOutRd, nullptr, 0, nullptr, &avail, nullptr)
+            || !avail)
+        {
+            if (GetTickCount64() >= deadline)
+                return false;
+            Sleep(100);
+            continue;
+        }
+        DWORD take = avail;
+        if (take > sizeof(t.buf) - t.bufLen)
+            take = (DWORD)(sizeof(t.buf) - t.bufLen);
+        DWORD got = 0;
+        if (!ReadFile(t.hOutRd, t.buf + t.bufLen, take, &got, nullptr)
+            || !got)
+            return false;
+        t.bufLen += got;
+    }
+}
+
+// file-mode handshake: poll the child's CLOSED handshake file
+// (mcrypt_va.txt - written once at startup, no live handle to share)
+// for "<pid> <va1> <va2>" (two pages = the r133 review P0-1
+// multi-block regression shape)
+static bool TargetHandshakeFromFile(unsigned long& pidOut,
+                                    unsigned long long& va1Out,
+                                    unsigned long long& va2Out,
+                                    DWORD timeoutMs)
+{
+    ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    while (GetTickCount64() < deadline)
+    {
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, L"mcrypt_va.txt", L"rb") == 0 && f)
+        {
+            char buf[160];
+            size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            buf[got] = 0;
+            unsigned long pid = 0;
+            unsigned long long va1 = 0, va2 = 0;
+            if (sscanf(buf, "%lu %llx %llx", &pid, &va1, &va2) == 3
+                && pid && va1 && va2)
+            {
+                pidOut = pid;
+                va1Out = va1;
+                va2Out = va2;
+                return true;
+            }
+        }
+        Sleep(150);
+    }
+    return false;
+}
+
+// crypte2e            - full verdict: spawn target, baseline readvm,
+//                       enc (readvm sees cipher, target self-checks stay
+//                       plaintext-ok), dec, readvm restored.
+// crypte2e hold       - enc and LEAVE live; write crypt_hold.txt
+//                       ("pid va"); child keeps running for the caller's
+//                       unload-restore leg (taskkill it after).
+// crypte2e chk <pid> <va-hex> - readvm 16B vs the pattern (post-unload
+//                       restore proof)
+static int CmdCryptE2E(const wchar_t* mode, const wchar_t* a1,
+                       const wchar_t* a2)
+{
+    if (!OpenDrv())
+        return 1;
+    if (mode && !_wcsicmp(mode, L"chk"))
+    {
+        if (!a1 || !a2)
+        {
+            printf("[!] usage: crypte2e chk <pid> <va-hex>\n");
+            return 1;
+        }
+        svmb_u32 pid = (svmb_u32)wcstoul(a1, nullptr, 0);
+        svmb_u64 va = _wcstoui64(a2, nullptr, 16);
+        svmb_u8 b[16];
+        DWORD err = 0;
+        if (!pid || !va || !CryptReadVm16(pid, va, b, &err))
+        {
+            printf("[-] crype2e chk: readvm failed (err %lu)\n", err);
+            return 1;
+        }
+        printf("chk bytes:");
+        for (int i = 0; i < 16; ++i)
+            printf(" %02x", b[i]);
+        printf("\n");
+        bool ok = PatternMatches16(b);
+        printf(ok ? "[+] crype2e chk PASS (plaintext restored)\n"
+                  : "[-] crype2e chk FAIL\n");
+        return ok ? 0 : 1;
+    }
+    const bool hold = mode && !_wcsicmp(mode, L"hold");
+
+    // a stale handshake file from a previous leg would hand us the DEAD
+    // child's pid+va (a recycled-pid trap); the child rewrites it at
+    // startup, we only poll a file we deleted first
+    DeleteFileW(L"mcrypt_va.txt");
+
+    TargetProc t;
+    if (!SpawnMcryptTarget(t, hold))
+        return 1;
+    int rc = 1;
+    bool childLeftAlive = false;
+    bool encLive = false; // set once the block maps exist (cleanup dec)
+    svmb_u8 plain[16], cur[16];
+    do
+    {
+        // 1. handshake: pid + the two page VAs (pipe line in full-cycle
+        // mode; the child's closed handshake file in hold mode)
+        char line[256] = "";
+        if (t.hOutRd)
+        {
+            if (!TargetGetLine(t, line, sizeof(line), 15000)
+                || sscanf(line, "MCRYPT-TARGET pid=%lu va1=0x%llx va2=0x%llx",
+                          &t.pid, &t.va, &t.va2) != 3)
+            {
+                printf("[-] crype2e handshake FAILED: %s\n", line);
+                break;
+            }
+        }
+        else if (!TargetHandshakeFromFile(t.pid, t.va, t.va2, 15000))
+        {
+            printf("[-] crype2e handshake (file) FAILED\n");
+            break;
+        }
+        else
+        {
+            DeleteFileW(L"mcrypt_va.txt"); // consume: no stale reuse
+        }
+        printf("[+] target pid=%lu va1=%llx va2=%llx\n", t.pid, t.va,
+               t.va2);
+
+        // 2. baseline: the operator's readvm sees the plaintext pattern
+        DWORD err = 0;
+        if (!CryptReadVm16((svmb_u32)t.pid, t.va, plain, &err))
+        {
+            printf("[-] crype2e baseline readvm failed (err %lu)\n", err);
+            break;
+        }
+        if (!PatternMatches16(plain))
+        {
+            printf("[-] crype2e baseline != pattern (target bug?)\n");
+            break;
+        }
+        printf("[+] baseline readvm = plaintext pattern\n");
+
+        // 3. encrypt BOTH pages as two separate blocks (the r133 review
+        // P0-1 multi-block shape) - each runs the two-phase dance:
+        // stage 1 (ARMED maps), per-core nudge, seal
+        unsigned long encPages = 0;
+        DWORD encErr = CryptEncStaged((svmb_u32)t.pid, t.va, 0x1000,
+                                      0xC0FFEE1234567890ull, &encPages);
+        if (!encErr)
+            encErr = CryptEncStaged((svmb_u32)t.pid, t.va2, 0x1000,
+                                    0x0F1E2D3C4B5A6978ull, &encPages);
+        if (encErr)
+        {
+            printf("[-] crype2e enc failed (err %lu)\n", encErr);
+            break;
+        }
+        encLive = true;
+        printf("[+] enc ok pages=%lu (two blocks sealed)\n", encPages);
+
+        // 4. (public build: the ovlstat disclosure leg rides protocol
+        //    tail fields that are not part of the public ABI)
+
+        // 5. operator view: readvm must now see CIPHERTEXT on BOTH pages
+        if (!CryptReadVm16((svmb_u32)t.pid, t.va, cur, &err))
+        {
+            printf("[-] crype2e readvm-during failed (err %lu)\n", err);
+            break;
+        }
+        if (memcmp(cur, plain, 16) == 0)
+        {
+            printf("[-] crype2e FAIL: readvm still plaintext after enc\n");
+            break;
+        }
+        printf("[+] readvm during enc = ciphertext:");
+        for (int i = 0; i < 16; ++i)
+            printf(" %02x", cur[i]);
+        printf("\n");
+        if (!CryptReadVm16((svmb_u32)t.pid, t.va2, cur, &err)
+            || memcmp(cur, plain, 16) == 0)
+        {
+            printf("[-] crype2e FAIL: page2 not ciphertext after enc\n");
+            break;
+        }
+        printf("[+] readvm during enc page2 = ciphertext\n");
+
+        // 6. target view: self-checks keep reporting plaintext-ok (pipe
+        // mode only - hold mode redirects to a file whose verdict the
+        // unload leg reads after the service cycle)
+        int okLines = 0, badLines = 0;
+        char firstBad[256] = "";
+        if (t.hOutRd)
+        {
+            ULONGLONG dl = GetTickCount64() + 6000;
+            while (GetTickCount64() < dl)
+            {
+                char l[256];
+                DWORD left = (DWORD)(dl - GetTickCount64());
+                if (!TargetGetLine(t, l, sizeof(l), left ? left : 1))
+                    break;
+                if (!strncmp(l, "MCRYPT-SELF", 11))
+                {
+                    if (strstr(l, "plaintext-ok"))
+                        ++okLines;
+                    if (strstr(l, "PLAINTEXT-DAMAGED"))
+                    {
+                        ++badLines;
+                        if (!firstBad[0])
+                            strncpy(firstBad, l, sizeof(firstBad) - 1);
+                    }
+                }
+            }
+            printf("[+] target self-checks during enc: ok=%d damaged=%d\n",
+                   okLines, badLines);
+            if (firstBad[0])
+                printf("[+] first damaged detail: %s\n", firstBad);
+            if (!okLines || badLines)
+            {
+                printf("[-] crype2e FAIL: target observed wrong bytes\n");
+                break;
+            }
+        }
+
+        if (hold)
+        {
+            // let the sealed state accumulate self-check lines in the
+            // output file (the unload leg's verdict input)
+            Sleep(4000);
+            FILE* f = nullptr;
+            if (fopen_s(&f, "crypt_hold.txt", "w") == 0 && f)
+            {
+                fprintf(f, "%lu %llx %llx\n", t.pid, t.va, t.va2);
+                fclose(f);
+            }
+            printf("[+] crype2e HOLD: two blocks left encrypted, "
+                   "crypt_hold.txt + mcrypt_hold_out.txt written, child "
+                   "alive (taskkill after the unload leg)\n");
+            rc = 0;
+            childLeftAlive = true;
+            break;
+        }
+
+        // 7. decrypt
+        SVMB_CR3_CRYPT d = {};
+        d.Action = 1;
+        d.Pid = (svmb_u32)t.pid;
+        d.BaseVa = t.va;
+        if (!Call(SVMB_IOCTL_CR3_CRYPT, &d, sizeof(d), &d, sizeof(d)))
+        {
+            printf("[-] crype2e dec failed (err %lu)\n", GetLastError());
+            break;
+        }
+        printf("[+] dec ok pages=%lu\n", (unsigned long)d.OutStatus);
+        d = {};
+        d.Action = 1;
+        d.Pid = (svmb_u32)t.pid;
+        d.BaseVa = t.va2;
+        if (!Call(SVMB_IOCTL_CR3_CRYPT, &d, sizeof(d), &d, sizeof(d)))
+        {
+            printf("[-] crype2e dec page2 failed (err %lu)\n",
+                   GetLastError());
+            break;
+        }
+        encLive = false; // both blocks are gone
+        printf("[+] dec page2 ok pages=%lu\n", (unsigned long)d.OutStatus);
+
+        // 8. operator view restored to plaintext on BOTH pages
+        if (!CryptReadVm16((svmb_u32)t.pid, t.va, cur, &err)
+            || memcmp(cur, plain, 16) != 0)
+        {
+            printf("[-] crype2e FAIL: readvm not restored after dec "
+                   "(err %lu)\n",
+                   err);
+            break;
+        }
+        printf("[+] readvm after dec = plaintext restored\n");
+        if (!CryptReadVm16((svmb_u32)t.pid, t.va2, cur, &err)
+            || memcmp(cur, plain, 16) != 0)
+        {
+            printf("[-] crype2e FAIL: page2 not restored after dec\n");
+            break;
+        }
+        printf("[+] readvm after dec page2 = plaintext restored\n");
+
+        SVMB_CR3_CRYPT l = {};
+        l.Action = 2;
+        if (Call(SVMB_IOCTL_CR3_CRYPT, &l, sizeof(l), &l, sizeof(l)))
+            printf("[+] crypt list after dec: %lu live\n",
+                   (unsigned long)l.OutStatus);
+        printf("[+] crype2e PASS\n");
+        rc = 0;
+    } while (false);
+
+    if (rc && encLive && !childLeftAlive)
+    {
+        // failure cleanup BEFORE the kill: leftover ARMED/SEALED blocks
+        // would pin the process-view binding slot (the leg-2 DEVICE_BUSY
+        // trap) and leak the overlays - dec BOTH best-effort while the
+        // target still lives
+        SVMB_CR3_CRYPT d = {};
+        d.Action = 1;
+        d.Pid = (svmb_u32)t.pid;
+        d.BaseVa = t.va;
+        BOOL ok1 = Call(SVMB_IOCTL_CR3_CRYPT, &d, sizeof(d), &d, sizeof(d));
+        d.BaseVa = t.va2;
+        BOOL ok2 = Call(SVMB_IOCTL_CR3_CRYPT, &d, sizeof(d), &d, sizeof(d));
+        if (ok1 && ok2)
+            printf("[+] cleanup dec ok (blocks removed)\n");
+        else
+            printf("[!] cleanup dec incomplete (crypt list to inspect)\n");
+    }
+    if (!childLeftAlive)
+        TerminateProcess(t.hProc, 0);
+    if (t.hProc)
+        CloseHandle(t.hProc);
+    if (t.hOutRd)
+        CloseHandle(t.hOutRd);
+    if (rc)
+        printf("[-] crype2e FAIL\n");
+    return rc;
+}
+
 static void Usage()
 {
     printf("svmbctl - svmb hypervisor control\n"
@@ -2417,6 +3037,13 @@ static void Usage()
            "  cr3 watch <exe> [key] watch image (arms now + on create); key = xor spoof key\n"
            "  cr3 unwatch          clear watch/spoof config\n"
            "  dbg events           drain debugger event ring\n"
+           "  crypt enc <pid> <va-hex> <size> <key-hex>\n"
+           "                       r133: encrypt a target block (dual-frame\n"
+           "                       split view - target reads plaintext,\n"
+           "                       readvm/scanners see ciphertext)\n"
+           "  crypt dec <pid> <va-hex>\n"
+           "                       r133: restore plaintext + identity map\n"
+           "  crypt list           r133: live encrypted blocks\n"
            "  log                  drain kernel log ring\n");
 }
 
@@ -2512,6 +3139,20 @@ int wmain(int argc, wchar_t** argv)
         rc = CmdCr3Regions();
     else if (!_wcsicmp(argv[1], L"cr3") && !_wcsicmp(argv[2], L"marker"))
         rc = CmdCr3Marker();
+    else if (!_wcsicmp(argv[1], L"crypt") && argc >= 3 &&
+             !_wcsicmp(argv[2], L"e2e"))
+        rc = CmdCryptE2E(argc >= 4 ? argv[3] : nullptr,
+                         argc >= 5 ? argv[4] : nullptr,
+                         argc >= 6 ? argv[5] : nullptr);
+    else if (!_wcsicmp(argv[1], L"crypt") && argc >= 7 &&
+             !_wcsicmp(argv[2], L"enc"))
+        rc = CmdCrypt(L"enc", argv[3], argv[4], argv[5], argv[6]);
+    else if (!_wcsicmp(argv[1], L"crypt") && argc >= 5 &&
+             !_wcsicmp(argv[2], L"dec"))
+        rc = CmdCrypt(L"dec", argv[3], argv[4], nullptr, nullptr);
+    else if (!_wcsicmp(argv[1], L"crypt") && argc >= 3 &&
+             !_wcsicmp(argv[2], L"list"))
+        rc = CmdCrypt(L"list", nullptr, nullptr, nullptr, nullptr);
     else if (!_wcsicmp(argv[1], L"cr3") && argc >= 6 &&
              !_wcsicmp(argv[2], L"readvm"))
         rc = CmdCr3ReadVm(argv[3], argv[4], argv[5],

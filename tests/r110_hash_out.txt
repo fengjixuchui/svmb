@@ -1,8 +1,8 @@
 --- svmb.sys --- 
 SHA256 的 C:\Users\wwa\Desktop\driverTest\svmb-test\svmb.sys 哈希:
-b3d4223d63b93e680cf56f57e40c6335554e8fded2829e3397f9768fef9726d1
+47074efd6f9f8b823a44656e8eac6bc7764bf4cfa1c43f1ad5dc5ea91df4ef96
 CertUtil: -hashfile 命令成功完成。
 --- svmbctl.exe --- 
 SHA256 的 C:\Users\wwa\Desktop\driverTest\svmb-test\svmbctl.exe 哈希:
-6c93c0825ca2dc7665207bae59fba582eaec27753447b25ecc665bf625827924
+f0d066711369bee9ef575b7d7398ca121769d79f99803b2f17ca1bbab78596d1
 CertUtil: -hashfile 命令成功完成。

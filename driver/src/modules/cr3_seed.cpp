@@ -2,6 +2,7 @@
 #include "platform/logger.h"
 #include "platform/offsets.h"
 
+
 namespace svmb
 {
 
@@ -217,3 +218,4 @@ bool Cr3Seed::LookupPidByCr3(u64 cr3, u32& pidOut, char* imageOut) const
 }
 
 } // namespace svmb
+

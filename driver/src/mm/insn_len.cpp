@@ -1,5 +1,6 @@
 #include "mm/insn_len.h"
 
+
 namespace svmb
 {
 
@@ -336,3 +337,4 @@ u32 InsnLen64(const u8* c, u32 maxLen, u32* ripFlagsOut)
 }
 
 } // namespace svmb
+

@@ -112,6 +112,23 @@ enum class Cr3ViewSwitch
 Cr3ViewSwitch Cr3ViewSwitchDecision(u64 curCr3, u64 newCr3, u64 targetCr3,
                                     bool processViewEnabled);
 
+
+// ---- r133: per-process NPT view arm (mem_crypt dependency) ----
+// Arm the per-process view for `pid`: resolve its CR3 from the EPROCESS
+// DTB (r83 offsets), create + fill the process view (1TB identity -
+// MMIO included), bind the r53 per-core publish policy (every core
+// switches to this view while pid's CR3 is current) and return the view
+// id via viewIdOut (0 on failure). The policy evaluates at every VM
+// exit - no CR3 intercept is armed. Refuses when the single binding
+// slot is owned by a different LIVE target CR3 (a dead owner's slot is
+// stealable).
+NTSTATUS Cr3M4ArmProcessView(u32 pid, u32* viewIdOut);
+// revert the binding when `pid` still owns it (cores fall back to the
+// base view at their next exit)
+void Cr3M4DisarmProcessView(u32 pid);
+// resolve a live pid's CR3 (EPROCESS DTB, PCID bits stripped)
+bool Cr3M4PidToCr3(u32 pid, u64* cr3Out);
+
 } // namespace svmb
 
 #endif // SVMB_CR3_MONITOR_H

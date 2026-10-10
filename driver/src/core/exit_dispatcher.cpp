@@ -3,6 +3,7 @@
 #include "platform/logger.h"
 #include "platform/util.h"
 
+
 namespace svmb
 {
 
@@ -255,3 +256,6 @@ void WriteGuestMsrPassthrough(u32 msr, u64 value)
 }
 
 } // namespace svmb
+
+
+

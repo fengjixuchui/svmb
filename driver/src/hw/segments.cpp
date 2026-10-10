@@ -1,5 +1,6 @@
 #include "hw/segments.h"
 
+
 // SimpleSvm technique: in long mode CS/DS/ES/SS base+limit are ignored, but
 // TR/LDTR keep real base/limit and every segment's attribute matters for
 // segment checks - so parse the GDT instead of faking values.
@@ -83,3 +84,4 @@ u32 GetSegmentLimitForVmcb(u16 selector, u64 gdtBase)
 }
 
 } // namespace svmb
+

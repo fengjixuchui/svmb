@@ -23,6 +23,7 @@
 #include "modules/stealth.h"
 #include "svmb/module_api.h"
 
+
 namespace svmb
 {
 
@@ -105,3 +106,4 @@ void StealthApplyScrub(u32 leaf, u32 res[4])
 }
 
 } // namespace svmb
+

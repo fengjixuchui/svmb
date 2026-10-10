@@ -3,6 +3,7 @@
 #include "core/crumbs.h"
 #include "platform/util.h"
 
+
 namespace svmb
 {
 
@@ -118,3 +119,4 @@ void TlbWiggleRestore(u64 activePml4Pa)
 }
 
 } // namespace svmb
+

@@ -3,6 +3,7 @@
 #include "hw/svm_defs.h"
 #include "platform/logger.h"
 
+
 namespace svmb
 {
 
@@ -314,3 +315,4 @@ bool HandleVmrunExit(GuestContext& ctx, void* ud)
 }
 
 } // namespace svmb
+

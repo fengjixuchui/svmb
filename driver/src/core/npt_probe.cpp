@@ -27,6 +27,7 @@
 #include "platform/logger.h"
 #include "platform/util.h"
 
+
 namespace svmb
 {
 
@@ -832,3 +833,4 @@ NTSTATUS RunNptProbe(SVMB_NPT_PROBE* p)
 }
 
 } // namespace svmb
+

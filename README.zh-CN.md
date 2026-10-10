@@ -4,7 +4,8 @@
 
 Windows 内核驱动：加载即把所有 CPU 核心置入 AMD-V (SVM) 虚拟化，在此基础上实现
 NPT 内存虚拟化、NPT 页权限钩子、CR3 保护套件（哨兵感知 / per-core 进程视图隔离 /
-CR3 读伪造）、X-deny 系统调用感知与跨进程行为分析，以及崩溃取证工具链。
+CR3 读伪造）、X-deny 系统调用感知与跨进程行为分析、进程内存块加解密（双帧分视），
+以及崩溃取证工具链。
 
 **当前状态：研究/测试平台可用，未达生产上线标准。**
 
@@ -26,6 +27,7 @@ CR3 读伪造）、X-deny 系统调用感知与跨进程行为分析，以及崩
 | 系统调用/执行感知（sysaudit） | 对 MmCopyVirtualMemory、NtCreateFile、NtOpenProcess、NtReadVirtualMemory、NtWriteVirtualMemory 所在页做 NPT X-deny（SSDT+SSN 锚定、多锚点校验）；入口取指 NPF 记录调用方 pid/映像 + 参数；页重开后原指令原生重执行；250ms 定时器再武装。**零 guest 字节修改**——构造上对 PatchGuard 不可见 | ✅ E2E（真实 NtCreateFile/NTRD 条目含 pid 归因，零丢失） |
 | 行为分析 | 1 秒窗口 per-(caller,target) 跨进程调用速率；边沿触发告警；阈值走注册表旋钮 | ✅ 实时运行（RD/WR/OP 三表） |
 | 告警响应 | 可逆挂起违规进程（默认**关闭**，BehaveResponse）、拒绝列表、终止时 live-EPROCESS 映像复核（K3） | ✅ E2E（kill=1/suspend=1，4h 双政策浸泡 395 轮） |
+| 内存块加解密（`crypt`） | 双帧分视：块内每页在目标自己的 NPT 视图上映射私有明文副本，**原帧**存 XOR 密钥流密文——目标持续读写明文，其他一切观察者（物理走读、扫描器）看到密文；退出代际门后的两阶段 seal（过渡期目标冻结）；免密钥解密 + 卸载期自动复原 | ✅ E2E（多块全周期 + hold + 活体目标穿越卸载复原，零坏字节读；离线套件 347/0） |
 | 崩溃取证 | 面包屑飞行记录器（无锁环，实时 IOCTL + 冻结内存离线解码）、kdump 辅助 | ✅（存活与冻结 guest 均成功解码） |
 | 模块系统 | debugger / cr3_monitor / sysaudit，函数表 API | ✅ |
 | 控制工具 | `svmbctl`：info/start/stop/storm/cr3 */exitprof/dbg */sysaudit/kdump/crumbs | ✅ |
@@ -43,6 +45,12 @@ CR3 读伪造）、X-deny 系统调用感知与跨进程行为分析，以及崩
   vhv 嵌套 TLB 弱点的承重墙补偿）；`1` = 从不刷新（仅裸 NPT 场景）。
 - **采样语义**（设计使然）：250ms 开窗内或缓存 TLB 翻译之后的调用不会被感知；
   紧凑进程内循环可以滑过再武装窗口。
+- **mem_crypt 视图同步契约**（r133）：per-core NCr3 只在 VM exit 时重发布，
+  受保护目标必须在块访问点取一次被拦 CPUID（同步点，见
+  `tests/mcrypt_target.c`）；无 exit 纪元若迁移到仍持有陈旧 base NCr3 的核，
+  读到的是原帧——seal 后即密文。结构性修复（per-core view selection）为
+  后续工作（`npt.h` M4 prerequisite）。U/S=0 base 视图读陷阱方案已实测并
+  否决：内核自己的工作集/压缩触碰会在数秒内拆掉它。
 - 硬编码 Windows 10 1903 (18362) 偏移；IOCTL 尚无权限模型；无微软正式签名
   （仅本地测试证书）。
 - 裸机（真 AMD 硬件）未验证。
@@ -111,6 +119,8 @@ Windows 10 x64 1903 (18362)，BCD `testsigning` 开启，自动登录已配置�
    - `svmbctl mod attach cr3_monitor` 后 `svmbctl cr3 watch notepad.exe`
    - `svmbctl cr3 readvm-self` — 虚拟化层内存读 E2E
    - `svmbctl mod attach sysaudit` 后 `svmbctl sysaudit` — 系统调用感知 + 行为表
+   - `svmbctl crypte2e` — 内存块加解密 E2E（enc 后操作员看到密文、目标读明文
+     → dec 复原）
 5. 回归脚本：`build/guest/multitarget.ps1`、`build/guest/blocksoak.bat`。
 
 ## 关键文档
@@ -122,6 +132,8 @@ Windows 10 x64 1903 (18362)，BCD `testsigning` 开启，自动登录已配置�
 - `docs/L2_BLOCKING_DESIGN.md` — 区域保护 sensing→blocking 升级设计
 - `docs/SECURITY_AUDIT.md` — 安全审计（发现/处置/遗留）
 - `docs/HYPERVISOR_MEM_READ.md` — 虚拟化层进程内存读取可行性评估
+- `docs/MEM_CRYPT.md` — 进程内存块加解密：双帧分视、两阶段 seal、视图同步
+  契约（含 U/S=0 陷阱方案的实测否决）
 
 ## 致谢与参考
 

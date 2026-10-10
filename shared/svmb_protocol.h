@@ -543,6 +543,50 @@ typedef struct _SVMB_CR3_READVM {  // IOCTL_CR3_READVM (in == out buffer)
                                         // payload may reflect recycled
                                         // frames (r87 TOCTOU marker)
 
+
+// r133 mem_crypt: per-process memory-block encryption, dual-frame split
+// view. enc maps every block page to a private plaintext copy on the
+// target's process NPT view (NptOverlay slot) and writes XOR-keystream
+// ciphertext into the ORIGINAL frames: the target keeps reading/writing
+// plaintext through its view, every other observer (readvm, physical
+// scanners, kernel threads on other CR3s) sees ciphertext. dec copies the
+// private plaintext back and restores identity - the key never
+// participates in decrypt (the private frame IS the authority). Driver
+// unload restores every live block the same way (order: write-back first,
+// then freeNow overlay unmap). Hard-crash recovery is manual: readvm the
+// ciphertext, XOR with the block key, writevm back (documented in
+// docs/MEM_CRYPT.md).
+#define SVMB_IOCTL_CR3_CRYPT    SVMB_CTL(0x82E)
+#define SVMB_CRYPT_MAX_PAGES   32  // the overlay engine's global slot
+                                   // ceiling (shared with hooks)
+#define SVMB_CRYPT_MAX_BLOCKS  8
+typedef struct _SVMB_CR3_CRYPT {  // IOCTL_CR3_CRYPT (in == out buffer)
+    svmb_u32 Action;      // 0 = encrypt stage 1 (ARMED: plaintext copies
+                          //     mapped on the process view, originals
+                          //     untouched - seal gate snapshot taken),
+                          //     1 = decrypt(restore), 2 = list,
+                          //     3 = seal (write the ciphertext - refuses
+                          //     with DEVICE_BUSY while cores still hold
+                          //     stale translations; the caller nudges:
+                          //     one pinned intercepted-CPUID per core,
+                          //     then retries. The ctl enc verb does the
+                          //     whole stage1+nudge+seal dance itself)
+    svmb_u32 Pid;         // target process (enc/dec)
+    svmb_u64 BaseVa;      // block start: user va, 4K aligned
+    svmb_u64 Size;        // block bytes: 4K multiple, pages fit the
+                          // remaining overlay slots (<= SVMB_CRYPT_MAX_PAGES)
+    svmb_u64 Key;         // keystream key, nonzero (enc only)
+    svmb_u32 OutStatus;   // out: pages processed (enc/dec), or the total
+                          // block count (list)
+    svmb_u32 Count;       // list out: entries filled in Blocks[]
+    struct {
+        svmb_u32 Pid;
+        svmb_u32 Pages;
+        svmb_u64 BaseVa;
+        svmb_u64 Size;
+    } Blocks[SVMB_CRYPT_MAX_BLOCKS];
+} SVMB_CR3_CRYPT, *PSVMB_CR3_CRYPT;
+
 typedef enum _SVMB_DBG_EVT {
     SvmbDbgEvtBreakpoint = 1,   // #BP (int3 / npt-hook cc)
     SvmbDbgEvtSingleStep,       // #DB with TF

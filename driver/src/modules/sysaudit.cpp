@@ -42,6 +42,7 @@
 #include "platform/saferead.h"
 #include "core/crumbs.h"
 
+
 // documented kernel interfaces whose declarations live in ntifs.h -
 // this driver is ntddk-only (mem_read.cpp / cr3_monitor.cpp pattern)
 extern "C" NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
@@ -1328,3 +1329,5 @@ void SysAuditBehaviorSnapshot(SVMB_SYSAUD_BEHAVIOR* out)
 SVMB_DEFINE_MODULE(ModuleSysAudit, "sysaudit", 10, SysAuditInit, SysAuditStop)
 
 } // namespace svmb
+
+

@@ -1,6 +1,7 @@
 #include "mm/npt.h"
 #include "platform/logger.h"
 
+
 namespace svmb
 {
 
@@ -776,3 +777,4 @@ void NptManager::SetApplyCallback(void (*cb)(u64 pml4Pa, void* ctx), void* ctx)
     ApplyCbCtx_ = ctx;
 }
 } // namespace svmb
+

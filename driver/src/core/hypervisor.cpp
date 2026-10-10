@@ -7,6 +7,7 @@
 #include "platform/logger.h"
 #include "platform/util.h"
 
+
 namespace svmb
 {
 
@@ -106,6 +107,7 @@ SvmCheckResult Hypervisor::CheckCpu()
     SVMB_LOGI("svm check: OK (AMD cpu, SVM bit=1, VM_CR.SVMDIS=0, NPT+NRIPS supported)");
     return SvmCheckResult::Ok;
 }
+
 
 NTSTATUS Hypervisor::Start()
 {
@@ -904,3 +906,5 @@ extern "C" void SvmbCrumbPostD(LONG tag, unsigned long long data)
 {
     svmb::CrumbPostD(tag, (svmb::u64)data);
 }
+
+

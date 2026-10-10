@@ -1,7 +1,15 @@
 #include "modules/npt_hook_mgr.h"
 #include "hw/svm_defs.h"
 #include "mm/tlb.h"
+#include "core/hypervisor.h" // r133: ForEachVcpu + ExitCount (generation gate)
 #include "platform/logger.h"
+
+// documented kernel interfaces whose declarations live in ntifs.h -
+// this driver is ntddk-only (mem_read.cpp / cr3_monitor.cpp pattern)
+extern "C" NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
+                                               PEPROCESS* Process);
+extern "C" NTSTATUS KeStackAttachProcess(void* Process, void* ApcState);
+extern "C" void KeUnstackDetachProcess(void* ApcState);
 
 namespace svmb
 {
@@ -77,6 +85,22 @@ u64 NTAPI NptHookManagedCb(u64 hookId, const SVMB_HOOK_FRAME* frame)
     return result;
 }
 
+// instance registered by Init - the notify callback is a free-function
+// shape but needs the singleton's lists
+NptHookManager* NptHookManager::s_self = nullptr;
+
+VOID NptHookManager::UserProcNotify(PEPROCESS, HANDLE pid,
+                                    PPS_CREATE_NOTIFY_INFO info)
+{
+    if (info)
+        return; // creation: nothing to do
+    if (!s_self || !s_self->Mm_)
+        return; // notify outlived Init (or registration failed) - no hooks
+    // process exit: drop the dying target's slot overlays (identity
+    // restore + pin release; the private frames park in the graveyard)
+    s_self->OverlayUnmapForPid((u32)(ULONG_PTR)pid);
+}
+
 NTSTATUS NptHookManager::Init(NptManager* mm)
 {
     if (!mm)
@@ -85,6 +109,15 @@ NTSTATUS NptHookManager::Init(NptManager* mm)
     if (!NT_SUCCESS(status))
         return status;
     Mm_ = mm;
+    s_self = this;
+    // r133: own process-exit notify for overlay cleanup (a second
+    // registration alongside cr3_seed's - the kernel allows multiple
+    // per driver). Sweeps a dying target's slot overlays so its pinned
+    // pages and GPA swaps never outlive it.
+    if (!NT_SUCCESS(PsSetCreateProcessNotifyRoutineEx(UserProcNotify,
+                                                      FALSE)))
+        SVMB_LOGW("npt hooks: overlay proc-notify registration failed - "
+                  "overlay death cleanup disabled");
     status = mm->FillDefaultView();
     if (!NT_SUCCESS(status) && status != STATUS_ALREADY_REGISTERED)
     {
@@ -97,6 +130,13 @@ NTSTATUS NptHookManager::Init(NptManager* mm)
 
 void NptHookManager::Deinit()
 {
+    // unregister the overlay death sweep FIRST (the notify's unmap path
+    // touches this manager; no callbacks may race teardown), then free
+    // every overlay outright - the hypervisor is stopping, no VMRUN can
+    // consult a stale translation
+    s_self = nullptr;
+    PsSetCreateProcessNotifyRoutineEx(UserProcNotify, TRUE);
+    OverlayUnmapForPid(0, true);
     // r36: let in-flight stub crossings finish before any page is freed -
     // past this point the view still exists, so each page's mapping is
     // restored and its split reference dropped exactly once (when its last
@@ -763,6 +803,482 @@ bool HookSlideApply(NptHookManager& hm, NptView& view, u64 gpa4k, u64 info1)
                   exec ? "EXEC" : "DATA", h->PagePa, pteNow, stR);
     }
     return true; // faulting instruction re-executes against the new state
+}
+
+
+bool NptHookManager::PageHasOverlay(u64 pagePa) const
+{
+    for (NptOverlay* o = OverlayList_; o; o = o->NextAll)
+        if (o->PagePa == pagePa)
+            return true;
+    return false;
+}
+
+NTSTATUS NptHookManager::OverlaySlotMap(u32 pid, u64 va, u32 zeroLen,
+                                        u32 viewId)
+{
+    SVMB_LOGI("npt slotmap enter: pid=%u va=%llx z=%u view=%u", pid, va,
+              zeroLen, viewId);
+    if (!Mm_ || !Mm_->NptEnabled())
+        return STATUS_DEVICE_NOT_READY;
+    if (IsKernelVa(va))
+    {
+        SVMB_LOGW("npt slotmap refuse: kernel va %llx", va);
+        return STATUS_INVALID_PARAMETER;
+    }
+    u64 pageVa = va & PAGE_MASK;
+    u64 off = va & ~PAGE_MASK;
+    if (zeroLen > 0x1000 || off + zeroLen > 0x1000)
+    {
+        SVMB_LOGW("npt slotmap refuse: zero window crosses page "
+                  "(va=%llx off=%llu z=%u)",
+                  va, off, zeroLen);
+        return STATUS_INVALID_PARAMETER; // zero window crosses the page
+    }
+    if (OverlayCount_ >= MAX_HOOKS)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    NptView* view = Mm_->View(viewId);
+    if (!view || !Mm_->OwnsRegisteredView(*view))
+    {
+        SVMB_LOGW("npt slotmap refuse: view id %u not live", viewId);
+        return STATUS_INVALID_PARAMETER; // arm the process view first
+    }
+
+    PEPROCESS proc = nullptr;
+    if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid,
+                                               &proc)) ||
+        !proc)
+    {
+        SVMB_LOGW("npt slotmap refuse: pid %u lookup", pid);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    struct alignas(16) UserApcState
+    {
+        UCHAR Bytes[64]; // >= KAPC_STATE (0x30), opaque (mem_read pattern)
+    };
+    UserApcState apc = {};
+    KeStackAttachProcess(proc, &apc);
+
+    u64 pagePa = 0;
+    void* privVa = nullptr;
+    u64 privPa = 0;
+    PMDL mdl = nullptr;
+    bool armedSwap = false;
+    NTSTATUS st = STATUS_INVALID_PARAMETER;
+
+    do
+    {
+        mdl = IoAllocateMdl((void*)(ULONG_PTR)pageVa, 0x1000, FALSE, FALSE,
+                            nullptr);
+        bool locked = false;
+        if (mdl)
+        {
+            __try
+            {
+                MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
+                locked = true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        if (!locked)
+        {
+            SVMB_LOGW("npt slotmap refuse: MDL probe failed (va=%llx)",
+                      pageVa);
+            st = STATUS_INVALID_PAGE_PROTECTION;
+            mdl = nullptr;
+            break;
+        }
+
+        PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((void*)(ULONG_PTR)pageVa);
+        if (pa.QuadPart == 0)
+        {
+            SVMB_LOGW("npt slotmap refuse: no physical backing (va=%llx)",
+                      pageVa);
+            break;
+        }
+        pagePa = pa.QuadPart & PAGE_MASK;
+        st = STATUS_SUCCESS; // the dedupe gate below tests THIS, not the
+                             // initializer - the stale-initial-value break
+                             // was the r128 err-87 mystery
+
+        // one overlay per (pid, page): a second map is a caller bug
+        for (NptOverlay* o = OverlayList_; o; o = o->NextAll)
+            if (o->UserPid == pid && o->PageVa == pageVa)
+            {
+                st = STATUS_OBJECT_NAME_COLLISION;
+                break;
+            }
+        if (!NT_SUCCESS(st))
+            break;
+        // a slide (hook) or a conceal decoy on this page would fight the
+        // static remap for the same GPA leaf
+        if (FirstPageHook(pagePa) || PageHasOverlay(pagePa))
+        {
+            SVMB_LOGW("npt slotmap refuse: slide/decoy owns page (pa=%llx)",
+                      pagePa);
+            st = NPT_HOOK_STATUS_OVERLAP;
+            break;
+        }
+        privVa = AllocNptPage(privPa);
+        if (!privVa)
+        {
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        // byte-identical private copy, slot window pre-zeroed pristine
+        RtlCopyMemory(privVa, (void*)(ULONG_PTR)pageVa, 0x1000);
+        if (zeroLen)
+            RtlZeroMemory((u8*)privVa + off, zeroLen);
+
+        st = view->Split2M(pagePa);
+        if (NT_SUCCESS(st))
+            st = view->SwapPage4k(pagePa, privPa >> 12, {true, true, true});
+        if (!NT_SUCCESS(st))
+        {
+            SVMB_LOGW("npt slotmap refuse: split/swap st=%08x pa=%llx",
+                      st, pagePa);
+            break;
+        }
+        view->RefSplit(pagePa);
+        armedSwap = true;
+
+        NptOverlay* o = (NptOverlay*)AllocNonPaged(sizeof(*o), TAG_NPTHK);
+        if (!o)
+        {
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        RtlZeroMemory(o, sizeof(*o));
+        o->PageVa = pageVa;
+        o->PagePa = pagePa;
+        o->PrivPa = privPa;
+        o->PrivVa = (u64)privVa;
+        o->UserPid = pid;
+        o->ViewId = viewId;
+        o->PinMdl = mdl;
+        o->NextAll = OverlayList_;
+        OverlayList_ = o;
+        ++OverlayCount_;
+        SVMB_LOGI("npt slotmap: pid=%u page=%llx priv=%llx zero=%u view=%u",
+                  pid, pageVa, privPa, zeroLen, viewId);
+        // acceptance N4: the process view is reused across runs per boot
+        // - a core holding a cached identity translation for it would
+        // keep routing slot writes to the ORIGINAL frame until its next
+        // exit. Make the flush explicit instead of relying on the
+        // publish path having kicked everything (the swap's shape).
+        TlbKickFlushAllCores();
+
+        KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(proc);
+        return STATUS_SUCCESS;
+    } while (false);
+
+    if (armedSwap)
+    {
+        (void)view->SwapPage4k(pagePa, pagePa >> 12, {true, true, true});
+        view->UnrefSplit(pagePa);
+    }
+    if (privVa)
+        FreeNptPage(privVa);
+    if (mdl)
+    {
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+    }
+    KeUnstackDetachProcess(&apc);
+    ObDereferenceObject(proc);
+    SVMB_LOGW("npt slotmap fail exit: pid=%u va=%llx st=%08x", pid, va, st);
+    return st;
+}
+
+NptOverlay* NptHookManager::FindOverlay(u32 pid, u64 pageVa)
+{
+    for (NptOverlay* o = OverlayList_; o; o = o->NextAll)
+        if (o->UserPid == pid && o->PageVa == pageVa)
+            return o;
+    return nullptr;
+}
+
+// r133 mem_crypt: read-only dual-frame disclosure (see header). The
+// lookup racing a concurrent exit-notify sweep returns null - the caller
+// treats that as "overlay gone, skip the frame" (records die first).
+bool NptHookManager::OverlayLookupFrame(u32 pid, u64 va, u64& origPa,
+                                        void** privVa)
+{    NptOverlay* o = FindOverlay(pid, va & PAGE_MASK);
+    if (!o)
+        return false;
+    origPa = o->PagePa;
+    *privVa = (void*)(ULONG_PTR)o->PrivVa;
+    return true;
+}
+
+
+// r130: per-vcpu ExitCount snapshot taken AFTER the kick flags are
+// armed. A core is safe to free against when its count has moved past
+// the snapshot: that exit consumed the pending kick and set
+// TLB_CTL_FLUSH_ALL, so the VMRUN after it runs with a fully flushed
+// TLB - the stale GPA->PrivPa translation can never be consulted again.
+// (Snapshot-after-arm closes the arm/consume race: an exit between arm
+// and snapshot is already counted past, and it happened after the flag
+// existed for that core.)
+static u64* OverlaySnapExitCounts(u32* count)
+{
+    *count = 0;
+    Hypervisor* hv = Hypervisor::Instance();
+    if (!hv || !hv->IsRunning())
+        return nullptr; // nothing can hold translations
+    VcpuContext* cpus[256];
+    u32 n = 0;
+    hv->ForEachVcpu([&](VcpuContext* v) {
+        if (n < 256)
+            cpus[n++] = v;
+    });
+    if (!n)
+        return nullptr;
+    u64* snap = (u64*)AllocNonPaged(sizeof(u64) * n, TAG_NPTHK);
+    if (!snap)
+        return nullptr;
+    for (u32 i = 0; i < n; ++i)
+        snap[i] = (u64)cpus[i]->Info.ExitCount;
+    *count = n;
+    return snap;
+}
+
+static bool OverlayAllCoresPast(const u64* snap, u32 n)
+{
+    Hypervisor* hv = Hypervisor::Instance();
+    if (!hv || !hv->IsRunning())
+        return true; // no VMRUN possible: stale entries are dead weight
+    u32 i = 0;
+    bool ok = true;
+    hv->ForEachVcpu([&](VcpuContext* v) {
+        if (i < n)
+        {
+            if ((u64)v->Info.ExitCount <= snap[i])
+                ok = false;
+            ++i;
+        }
+    });
+    return ok && i >= n;
+}
+
+// r133: public gate over the r130 reaper primitives (see header)
+u64* NptHookManager::OverlayArmGeneration(u32& countOut)
+{
+    return OverlaySnapExitCounts(&countOut);
+}
+bool NptHookManager::OverlayGenerationPassed(const u64* snap, u32 n)
+{
+    return OverlayAllCoresPast(snap, n);
+}
+void NptHookManager::OverlayFreeGeneration(u64* snap)
+{
+    if (snap)
+        FreeNonPaged(snap, TAG_NPTHK);
+}
+
+void NptHookManager::OverlaySlotDetach(NptOverlay* o, u64& privVaOut,
+                                       u64& privPaOut)
+{
+    // restore identity on the one view that carried the copy; a view
+    // that already went away (disarm raced teardown) leaves nothing to
+    // restore - its pages died with it
+    NptView* view = Mm_ ? Mm_->View(o->ViewId) : nullptr;
+    if (view)
+    {
+        (void)view->SwapPage4k(o->PagePa, o->PagePa >> 12,
+                               {true, true, true});
+        view->UnrefSplit(o->PagePa);
+    }
+    if (o->PinMdl)
+    {
+        MmUnlockPages(o->PinMdl);
+        IoFreeMdl(o->PinMdl);
+    }
+    privVaOut = o->PrivVa;
+    privPaOut = o->PrivPa;
+    FreeNonPaged(o, TAG_NPTHK);
+    --OverlayCount_;
+    // the private page stays allocated - the caller parks (or frees
+    // outright at Deinit, where the hypervisor is stopping)
+}
+
+void NptHookManager::ParkOverlayPage(u64 privVa, u64 privPa)
+{
+    u32 snapCount = 0;
+    u64* snap = OverlaySnapExitCounts(&snapCount);
+    NptOverlayGrave* g = (NptOverlayGrave*)AllocNonPaged(sizeof(*g),
+                                                         TAG_NPTHK);
+    if (!g)
+    {
+        // no record possible: free inline IF safe, else keep the page
+        // allocated (a bounded leak beats freeing against live
+        // translations)
+        if (!snap || OverlayAllCoresPast(snap, snapCount))
+            FreeNptPage((void*)privVa);
+        if (snap)
+            FreeNonPaged(snap, TAG_NPTHK);
+        SVMB_LOGW("npt overlay grave: alloc failed (leak guard) "
+                  "priv=%llx",
+                  privPa);
+        return;
+    }
+    RtlZeroMemory(g, sizeof(*g));
+    g->PrivVa = privVa;
+    g->PrivPa = privPa;
+    g->Snap = snap;
+    g->SnapCount = snapCount;
+    g->Next = OverlayGrave_;
+    OverlayGrave_ = g;
+    ++GraveCount_;
+    // cap: mirror the hook graveyard - reap first, then evict the
+    // oldest ONLY past its generation; a never-exiting core parks its
+    // frames forever (loud, bounded - never freed while observable)
+    if (GraveCount_ > MAX_OVERLAY_GRAVE)
+    {
+        ReapOverlayGraveyard();
+        while (GraveCount_ > MAX_OVERLAY_GRAVE && OverlayGrave_)
+        {
+            NptOverlayGrave** pp = &OverlayGrave_;
+            while (*pp && (*pp)->Next)
+                pp = &(*pp)->Next;
+            NptOverlayGrave* oldest = *pp;
+            if (!oldest)
+                break;
+            if (OverlayAllCoresPast(oldest->Snap, oldest->SnapCount))
+            {
+                *pp = nullptr;
+                FreeOverlayGrave(oldest);
+            }
+            else
+            {
+                SVMB_LOGW("npt overlay grave: cap with un-reapable "
+                          "oldest (a core never exited) - holding");
+                break;
+            }
+        }
+    }
+}
+
+void NptHookManager::FreeOverlayGrave(NptOverlayGrave* g)
+{
+    FreeNptPage((void*)g->PrivVa);
+    if (g->Snap)
+        FreeNonPaged(g->Snap, TAG_NPTHK);
+    FreeNonPaged(g, TAG_NPTHK);
+    --GraveCount_;
+}
+
+void NptHookManager::ReapOverlayGraveyard()
+{
+    if (!OverlayGrave_)
+        return;
+    // NOTE (r130 law, learned the hard way): NOTHING on the kernel side
+    // can force an exit on demand here. External interrupts are not
+    // intercepted (the guest IS this same Windows - an IPI or DPC
+    // broadcast executes in guest context without a single VM exit;
+    // KeIpiGenericCall was tried and provably does not move ExitCount),
+    // and an affinity-set visit cannot reach cores parked in guest HLT.
+    // The ONLY events that exit are the intercepted ones (CPUID/MSR/
+    // NPF) - so the r122b fuse is also the reaper's wake-up: the ctl
+    // side nudges every core with a pinned __cpuid before polling.
+    NptOverlayGrave** pp = &OverlayGrave_;
+    while (*pp)
+    {
+        NptOverlayGrave* g = *pp;
+        if (OverlayAllCoresPast(g->Snap, g->SnapCount))
+        {
+            *pp = g->Next;
+            u64 privPa = g->PrivPa;
+            FreeOverlayGrave(g);
+            SVMB_LOGI("npt overlay grave: reaped priv=%llx", privPa);
+            continue;
+        }
+        pp = &g->Next;
+    }
+}
+
+NTSTATUS NptHookManager::OverlaySlotUnmap(u32 pid, u64 va)
+{
+    NptOverlay** pp = &OverlayList_;
+    while (*pp)
+    {
+        NptOverlay* o = *pp;
+        if (o->UserPid == pid && o->PageVa == (va & PAGE_MASK))
+        {
+            *pp = o->NextAll;
+            u64 privVa = 0, privPa = 0;
+            OverlaySlotDetach(o, privVa, privPa);
+            TlbKickFlushAllCores(); // cross-core staleness (reveal law)
+            ParkOverlayPage(privVa, privPa); // snapshot AFTER the kick
+            SVMB_LOGI("npt slotunmap: pid=%u page=%llx (parked)", pid,
+                      va & PAGE_MASK);
+            ReapOverlayGraveyard();
+            return STATUS_SUCCESS;
+        }
+        pp = &o->NextAll;
+    }
+    return STATUS_NOT_FOUND;
+}
+
+void NptHookManager::OverlayUnmapForPid(u32 pid, bool freeNow)
+{
+    if (!Mm_)
+        return;
+    // freeNow (Deinit): the hypervisor is stopping - no VMRUN can
+    // consult a stale translation, so detach frees the page outright
+    // with no kick, no park
+    if (freeNow)
+    {
+        while (OverlayList_)
+        {
+            NptOverlay* o = OverlayList_;
+            OverlayList_ = o->NextAll;
+            u64 privVa = 0, privPa = 0;
+            OverlaySlotDetach(o, privVa, privPa);
+            FreeNptPage((void*)privVa);
+        }
+        while (OverlayGrave_)
+        {
+            NptOverlayGrave* g = OverlayGrave_;
+            OverlayGrave_ = g->Next;
+            FreeOverlayGrave(g);
+        }
+        return;
+    }
+    u64 privVas[64];
+    u64 privPas[64];
+    u32 n = 0;
+    NptOverlay** pp = &OverlayList_;
+    while (*pp)
+    {
+        NptOverlay* o = *pp;
+        if (pid != 0 && o->UserPid != pid)
+        {
+            pp = &o->NextAll;
+            continue;
+        }
+        *pp = o->NextAll;
+        u64 va = 0, pa = 0;
+        OverlaySlotDetach(o, va, pa);
+        if (n < 64)
+        {
+            privVas[n] = va;
+            privPas[n] = pa;
+            ++n;
+        }
+        else // overflow (unreachable: OverlayCount_ <= MAX_HOOKS=32)
+            FreeNptPage((void*)va);
+    }
+    if (!n)
+        return;
+    TlbKickFlushAllCores(); // ONE kick covers every pending detach
+    for (u32 i = 0; i < n; ++i)
+        ParkOverlayPage(privVas[i], privPas[i]); // same post-kick snap
+    ReapOverlayGraveyard();
 }
 
 } // namespace svmb

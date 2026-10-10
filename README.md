@@ -6,7 +6,8 @@ Windows kernel driver that puts every CPU core into AMD-V (SVM) mode right at
 driver load, and on top of that builds: NPT memory virtualization, NPT-based
 page-permission hooks, a CR3 protection suite (sentinel sensing / per-core
 process-view isolation / read spoofing), X-deny syscall sensing with
-cross-process behavior analytics, and crash forensics tooling.
+cross-process behavior analytics, per-process memory-block encryption
+(dual-frame split view), and crash forensics tooling.
 
 **Status: research / test platform — not production-ready.**
 
@@ -30,6 +31,7 @@ cross-process behavior analytics, and crash forensics tooling.
 | Syscall / exec sensing (`sysaudit`) | X-denies the pages of MmCopyVirtualMemory, NtCreateFile, NtOpenProcess, NtReadVirtualMemory, NtWriteVirtualMemory (SSDT+SSN anchored, multi-anchor validated); entry-fetch NPF records caller pid/image + args; page reopens and the instruction re-executes natively; 250ms timer re-arms. **Zero guest bytes modified** — PatchGuard-invisible by construction | ✅ E2E (real NtCreateFile/NTRD entries with pid attribution, zero lost) |
 | Behavior analytics | 1s-window per-(caller,target) cross-process call rates; edge-triggered alerts; thresholds via registry knobs | ✅ live (RD/WR/OP tables) |
 | Alert response | reversible suspend of offending processes (default **off**, `BehaveResponse`), deny-list, kill-time live-EPROCESS image re-verify (K3) | ✅ E2E (kill=1/suspend=1, 4h dual-policy soak 395 iters) |
+| Memory-block encryption (`crypt`) | dual-frame split view: each block page maps to a private plaintext copy on the target's own NPT view while the ORIGINAL frame stores XOR-keystream ciphertext — the target keeps reading/writing plaintext, every other observer (physical walk, scanners) sees ciphertext; two-phase seal behind an exit-generation gate (target frozen across the transition); key-free decrypt + unload-time restore | ✅ E2E (multi-block cycle + hold + unload-restore with a live target, zero damaged reads; offline suite 347/0) |
 | Crash forensics | breadcrumb flight recorder (lock-free ring, live IOCTL + offline suspended-RAM decode), kdump helper | ✅ (decoded both live and frozen guests) |
 | Module system | debugger / cr3_monitor / sysaudit modules over a function-table API | ✅ |
 | Control tool | `svmbctl`: info/start/stop/storm/cr3 */exitprof/dbg */sysaudit/kdump/crumbs | ✅ |
@@ -51,6 +53,15 @@ cross-process behavior analytics, and crash forensics tooling.
 - **Sampling semantics** (by design): calls inside the 250ms open window or
   behind cached TLB translations are not sensed; a tight in-process loop can
   slide past the re-arm.
+- **mem_crypt view-sync contract** (r133): the per-core NCr3 is republished
+  only at VM exits, so a protected target must take an intercepted CPUID at
+  its block-access points (the sync point — see
+  `tests/mcrypt_target.c`); an exitless epoch that migrates to a core still
+  holding a stale base NCr3 reads the original frame, which is ciphertext
+  post-seal. Structural fix (per-core view selection) is future work
+  (`npt.h` M4 prerequisite). A U/S=0 base-view read-trap was measured and
+  rejected: the kernel's own working-set/compression touches disarm it
+  within seconds.
 - Hardcoded Windows 10 1903 (18362) offsets; IOCTLs have no permission
   model yet; no Microsoft signature (local test cert only).
 - Bare metal (real AMD hardware) is unverified.
@@ -125,6 +136,8 @@ for the hard rules these scripts encode).
    - `svmbctl cr3 readvm-self` — hypervisor-level memory read E2E
    - `svmbctl mod attach sysaudit` then `svmbctl sysaudit` — syscall sensing
      + behavior table
+   - `svmbctl crypte2e` — memory-block encryption E2E (enc → operator sees
+     ciphertext while the target reads plaintext → dec → restore)
 5. Regression: `build/guest/multitarget.ps1`, `build/guest/blocksoak.bat`.
 
 ## Key Documents
@@ -137,6 +150,9 @@ for the hard rules these scripts encode).
 - `docs/L2_BLOCKING_DESIGN.md` — sensing→blocking escalation design
 - `docs/SECURITY_AUDIT.md` — security audit findings and dispositions
 - `docs/HYPERVISOR_MEM_READ.md` — hypervisor-level process-memory read
+- `docs/MEM_CRYPT.md` — per-process memory-block encryption: dual-frame
+  split view, two-phase seal, view-sync contract (and the measured
+  U/S=0-trap rejection)
 
 ## Credits & References
 

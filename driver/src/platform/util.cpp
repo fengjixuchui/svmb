@@ -1,5 +1,6 @@
 #include "platform/util.h"
 
+
 // Allocation policy: legacy ExAllocatePoolWithTag only (no ExAllocatePool2),
 // so the driver loads on every Windows 10 build (1507+) and Server 2016+.
 // NonPagedPoolNx keeps routine allocations non-executable (Win8+).
@@ -161,3 +162,4 @@ void HashTable::Remove(u64 key)
 }
 
 } // namespace svmb
+

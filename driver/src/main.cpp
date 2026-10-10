@@ -10,6 +10,7 @@
 #include "modules/dbg_events.h"
 #include "modules/cr3_monitor.h"
 #include "modules/mem_read.h"
+#include "modules/mem_crypt.h"
 #include "modules/debugger.h"
 #include "platform/logger.h"
 #include "platform/saferead.h"
@@ -464,6 +465,23 @@ NTSTATUS DevCtrlLocked(PIRP irp)
         break;
     }
 
+    case SVMB_IOCTL_CR3_CRYPT:
+    {
+        // r133 mem_crypt: dual-frame block encrypt/decrypt/list. Runs the
+        // full gate (arm view + suspend target + overlay map + original-
+        // frame writes); MemCryptAction validates its own inputs.
+        if (inLen < sizeof(SVMB_CR3_CRYPT) || outLen < sizeof(SVMB_CR3_CRYPT))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        SVMB_CR3_CRYPT* mc = (SVMB_CR3_CRYPT*)buf;
+        status = MemCryptAction(mc);
+        if (NT_SUCCESS(status))
+            info = sizeof(SVMB_CR3_CRYPT); // r127 law: copy the tail back
+        break;
+    }
+
     case SVMB_IOCTL_SYSCALL_AUDIT:
     {
         // r99 sysaudit drain (consume, like LOG_READ). The ring lock is
@@ -881,6 +899,11 @@ void IoReleaseGate()
 // tolerant of its component never having been initialized
 void OfflineTeardown()
 {
+    // r133 ORDER LAW: mem_crypt restores every live block's plaintext
+    // BEFORE the overlays (and their private frames) die with gHooks -
+    // the reversed order strands ciphertext in live frames. Must also
+    // precede gNpt teardown (the restore path walks NPT views).
+    MemCryptDeinit();
     if (gCr3Seed)
     {
         gCr3Seed->Deinit(); // unregisters the process notify callback
@@ -1263,6 +1286,10 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING)
         LogDeinit();
         return status;
     }
+    // r133: mem_crypt block table + process-exit sweep (needs the hook
+    // manager only at IOCTL time; registration here just pairs its
+    // lifetime with the device's)
+    MemCryptLoadInit();
 
     // tier-3 gate: NPT goes live only when explicitly switched on via
     // Parameters/NptEnable (default OFF - keep start crash-line resolved

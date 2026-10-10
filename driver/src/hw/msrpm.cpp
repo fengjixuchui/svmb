@@ -2,6 +2,7 @@
 #include "platform/util.h"
 #include "platform/logger.h"
 
+
 namespace svmb
 {
 
@@ -270,3 +271,4 @@ bool Iopm::GetPortIntercept(u32 port, bool& read, bool& write) const
 }
 
 } // namespace svmb
+

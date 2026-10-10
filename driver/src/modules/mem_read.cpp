@@ -28,6 +28,7 @@
 #include "mm/npt.h"
 #include "platform/logger.h"
 
+
 // documented kernel interfaces whose declarations live in ntifs.h; this
 // driver is ntddk-only (same pattern as the r75 declarations in
 // cr3_monitor.cpp; KeStackAttachProcess fills the opaque APC state, we
@@ -322,3 +323,4 @@ void MemReadVmStats(u32& callsOut, u32& pagesOut)
 }
 
 } // namespace svmb
+

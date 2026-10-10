@@ -8,6 +8,7 @@
 #include "modules/cr3_monitor.h"
 #include "modules/cr3_seed.h"
 #include "modules/mem_read.h"
+#include "modules/mem_crypt.h"
 #include "modules/stealth.h"
 #include "modules/sysaudit.h"
 #include "core/regs.h"
@@ -15,6 +16,7 @@
 #include "hw/svm_defs.h"
 #include "mm/phys_mem.h"
 #include "platform/logger.h"
+
 
 namespace svmb
 {
@@ -813,6 +815,74 @@ void TestMemReadPure(StCtx& c)
     Check(c, !IsKernelVa(0x8000000000000000ull), "rdvm.kva.noncanon");
 }
 
+// r133 mem_crypt keystream: the pure core behind enc/dec. Position-
+// addressability is the load-bearing property - a block encrypts page by
+// page (offset = pageIndex*0x1000) yet must form ONE continuous stream,
+// and decrypt regenerates it exactly.
+void TestCryptStream(StCtx& c)
+{
+    u8 plain[64], ct1[64], ct2[64];
+    const u64 key = 0x0123456789ABCDEFull;
+    for (u32 i = 0; i < sizeof(plain); ++i)
+        plain[i] = (u8)(i * 7 + 1);
+
+    // identity: enc then dec restores the original (any offset shape)
+    RtlCopyMemory(ct1, plain, sizeof(plain));
+    CryptXorStream(key, 0, ct1, sizeof(ct1));
+    Check(c, RtlCompareMemory(ct1, plain, sizeof(ct1)) != sizeof(ct1),
+          "crypt.enc-changes");
+    CryptXorStream(key, 0, ct1, sizeof(ct1));
+    Check(c, RtlCompareMemory(ct1, plain, sizeof(ct1)) == sizeof(ct1),
+          "crypt.identity");
+
+    // offset continuity: a slice at offset O equals the same slice of a
+    // zero-offset stream (call shape must not matter)
+    RtlZeroMemory(ct1, sizeof(ct1));
+    RtlZeroMemory(ct2, sizeof(ct2));
+    CryptXorStream(key, 0, ct1, sizeof(ct1));        // whole window
+    CryptXorStream(key, 23, ct2, 17);                // mid-window slice
+    Check(c, RtlCompareMemory(ct2, ct1 + 23, 17) == 17,
+          "crypt.offset-continuity");
+
+    // unaligned tail: offset 23 + len 17 crosses a word boundary and ends
+    // mid-word - the next slice must continue the same stream
+    CryptXorStream(key, 40, ct2 + 17, 24);           // resume right after
+    Check(c, RtlCompareMemory(ct2, ct1 + 23, 41) == 41,
+          "crypt.resume-continuity");
+
+    // cross-page shape: page-by-page calls == one whole-block call
+    u8 whole[0x2000], paged[0x2000];
+    const u64 k2 = 0xDEADBEEFCAFE1234ull;
+    RtlZeroMemory(whole, sizeof(whole));
+    RtlCopyMemory(paged, whole, sizeof(paged));
+    CryptXorStream(k2, 0, whole, sizeof(whole));
+    for (u32 p = 0; p < 2; ++p)
+        CryptXorStream(k2, (u64)p * 0x1000, paged + p * 0x1000, 0x1000);
+    Check(c, RtlCompareMemory(whole, paged, sizeof(whole)) == sizeof(whole),
+          "crypt.page-shape");
+
+    // key divergence: two keys must not agree on a 4K keystream (fixed
+    // test vector - deterministic, no flakiness)
+    RtlZeroMemory(ct1, sizeof(ct1));
+    RtlZeroMemory(ct2, sizeof(ct2));
+    CryptXorStream(key, 0, ct1, sizeof(ct1));
+    CryptXorStream(k2, 0, ct2, sizeof(ct2));
+    Check(c, RtlCompareMemory(ct1, ct2, sizeof(ct1)) != sizeof(ct1),
+          "crypt.key-divergence");
+
+    // key=0 contract: no-op (the IOCTL layer refuses it outright - this
+    // pins the pure-function fallback)
+    RtlCopyMemory(ct1, plain, sizeof(ct1));
+    CryptXorStream(0, 0, ct1, sizeof(ct1));
+    Check(c, RtlCompareMemory(ct1, plain, sizeof(ct1)) == sizeof(ct1),
+          "crypt.zero-key-noop");
+
+    // zero-length contract
+    CryptXorStream(key, 0, ct1, 0);
+    Check(c, RtlCompareMemory(ct1, plain, sizeof(ct1)) == sizeof(ct1),
+          "crypt.zero-len-noop");
+}
+
 // r89: kill-policy deny list (plan C - system-critical images survive a
 // bypass trip even when their CR3 resolves)
 void TestKillDenylist(StCtx& c)
@@ -1131,6 +1201,7 @@ NTSTATUS RunOfflineSelfTests(SVMB_SELFTEST_RESULT* out)
     TestNpfHookSlide(c);
     TestCr3Match(c);
     TestMemReadPure(c);
+    TestCryptStream(c);
     TestKillDenylist(c);
     TestStealthScrub(c);
     TestSysAuditRing(c);
@@ -1151,3 +1222,4 @@ NTSTATUS RunOfflineSelfTests(SVMB_SELFTEST_RESULT* out)
 }
 
 } // namespace svmb
+

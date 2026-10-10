@@ -1,5 +1,6 @@
 #include "mm/phys_mem.h"
 #include "platform/util.h"
+
 // legacy pool API for down-level compatibility (see util.cpp)
 #pragma warning(disable : 4996)
 
@@ -90,3 +91,4 @@ void FreeNptPage(void* va)
 }
 
 } // namespace svmb
+

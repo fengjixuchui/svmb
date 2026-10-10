@@ -4,6 +4,7 @@
 #include "platform/offsets.h"
 #include "platform/logger.h"
 
+
 namespace svmb
 {
 
@@ -222,3 +223,4 @@ NTSTATUS OffsetsResolve()
 }
 
 } // namespace svmb
+

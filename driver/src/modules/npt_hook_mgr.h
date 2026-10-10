@@ -100,6 +100,47 @@ struct NptHook : HashNode
     SvmbHookCallback Cb;
 };
 
+// r128 slot-overlay record: one statically privatized user page. The
+// page's 4K GPA remaps to a private byte-copy on EXACTLY ONE registered
+// view (the target's process view); every other view keeps the identity
+// mapping - unlike a slide there is NO exec/data flipping: reads AND
+// writes through the target's view hit the private frame directly, the
+// shared original is never touched by target traffic. The MDL pin
+// (r86 law) holds the frame while the view aliases the copy over its
+// GFN. Slot RW goes through the driver (the operator's readvm/writevm
+// still resolve the ORIGINAL frame - the per-view privatization is the
+// point).
+struct NptOverlay
+{
+    NptOverlay* NextAll;
+    u64 PageVa;   // user page VA in the target (RW/unmap lookup key)
+    u64 PagePa;   // 4K-aligned PA of the original shared frame
+    u64 PrivPa;   // PA of the private copy
+    u64 PrivVa;   // kernel VA of the private copy (RW window)
+    u32 UserPid;  // owner (sweep key)
+    u32 ViewId;   // the ONE view the copy is mapped into
+    PMDL PinMdl;
+};
+
+// r130 parked private frame: an unmapped slot overlay's private copy.
+// FreeNptPage cannot run at unmap time - TlbKickFlushAllCores is a
+// PENDING flag each core consumes at its own exit entry (r108 law), so
+// other cores may hold cached GPA->PrivPa translations for a while
+// longer; freeing immediately could hand a hot stub's `lock inc [slot]`
+// to a reallocated frame (page tables = hard freeze). A frame parks
+// with a POST-KICK per-vcpu ExitCount snapshot and frees when every
+// core's count has moved past it (that core consumed the kick, and the
+// VMRUN after the consuming exit flushed every cached translation via
+// TLB_CTL_FLUSH_ALL - the stale entry can never be used again).
+struct NptOverlayGrave
+{
+    NptOverlayGrave* Next;
+    u64 PrivPa;
+    u64 PrivVa;   // kernel VA of the parked page (FreeNptPage target)
+    u64* Snap;    // per-vcpu ExitCount taken after the kick was armed
+    u32 SnapCount;
+};
+
 class NptHookManager
 {
 public:
@@ -132,6 +173,11 @@ public:
 
     NTSTATUS Init(NptManager* mm); // fills the default view (PassiveLevel)
     void Deinit();                 // removes all hooks, frees everything
+
+    // r133: own process-exit notify - sweeps a dying target's slot
+    // overlays (registered in Init, unregistered in Deinit)
+    static VOID UserProcNotify(PEPROCESS, HANDLE, PPS_CREATE_NOTIFY_INFO);
+    static NptHookManager* s_self; // instance for the free-shape callback
 
     NTSTATUS Install(u64 targetVa, u64 detourVa, u8 mode);
 
@@ -205,6 +251,53 @@ public:
         return Mm_ ? Mm_->CollectViews(out, NptManager::MAX_VIEWS) : 0;
     }
 
+    NTSTATUS OverlaySlotMap(u32 pid, u64 va, u32 zeroLen, u32 viewId);
+    NTSTATUS OverlaySlotUnmap(u32 pid, u64 va);
+    // sweep every overlay of a pid (or all when pid==0); freeNow
+    // (Deinit path: hypervisor stopping) frees the private frames
+    // outright with no graveyard park
+    void OverlayUnmapForPid(u32 pid, bool freeNow = false);
+    // r133 mem_crypt query: resolve the dual-frame pair of a live (pid,
+    // page) slot overlay - the ORIGINAL frame PA (ciphertext store during
+    // enc, plaintext restore target during dec/unload) and the kernel-VA
+    // window of the private plaintext copy. Read-only; safe under the
+    // IOCTL gate against other IOCTL mutations, and against a target-exit
+    // sweep only in the mem_crypt shape (target suspended, pid reaped
+    // after) - a lookup racing the exit notify's OverlayUnmapForPid sees
+    // null and the caller skips the frame (the block record died first).
+    bool OverlayLookupFrame(u32 pid, u64 va, u64& origPa, void** privVa);
+    // ---- r133 exit-generation gate (external dual-frame writers) ------
+    // ArmGeneration snapshots every vcpu's ExitCount NOW (caller must
+    // have armed the TLB kick first - snapshot-after-arm closes the
+    // arm/consume race). GenerationPassed reports whether every core has
+    // exited at least once since (each such exit consumed the pending
+    // kick = TLB_CTL_FLUSH_ALL on its next VMRUN, and re-ran the per-core
+    // view policy with the then-current CR3). The r130 reaper semantics,
+    // exposed for mem_crypt's two-phase seal. Free the snapshot with
+    // FreeGeneration (AllocNonPaged/TAG_NPTHK pair).
+    u64* OverlayArmGeneration(u32& countOut);
+    static bool OverlayGenerationPassed(const u64* snap, u32 n);
+    static void OverlayFreeGeneration(u64* snap);
+    void ReapOverlayGraveyard();
+    void OverlayStats(u32& live, u32& grave) const
+    {
+        live = OverlayCount_;
+        grave = GraveCount_;
+    }
+    u32 OverlayCount() const { return OverlayCount_; }
+
+
+    // r133/mem_crypt overlay bookkeeping (private)
+    static constexpr u32 MAX_OVERLAY_GRAVE = 32;
+    NptOverlay* FindOverlay(u32 pid, u64 pageVa);
+    bool PageHasOverlay(u64 pagePa) const;
+    void OverlaySlotDetach(NptOverlay* o, u64& privVaOut, u64& privPaOut);
+    void ParkOverlayPage(u64 privVa, u64 privPa);
+    void FreeOverlayGrave(NptOverlayGrave* g);
+    NptOverlay* OverlayList_ = nullptr;
+    u32 OverlayCount_ = 0;
+    NptOverlayGrave* OverlayGrave_ = nullptr;
+    u32 GraveCount_ = 0;
 private:
     NTSTATUS StealLen(u64 targetVa, u32 need, u32 pageRemain, u32& stolenOut) const;
 

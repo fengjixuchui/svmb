@@ -34,6 +34,7 @@ constexpr u32 TAG_NPTHK  = MAKE_TAG_('n', 'p', 't', 'h'); // hook engine
 constexpr u32 TAG_HOOK   = MAKE_TAG_('h', 'o', 'o', 'k'); // swap pages / trampolines
 constexpr u32 TAG_DBG    = MAKE_TAG_('s', 'd', 'b', 'g'); // debugger module
 constexpr u32 TAG_CR3    = MAKE_TAG_('s', 'c', 'r', '3'); // cr3 module
+constexpr u32 TAG_MCRT   = MAKE_TAG_('m', 'c', 'r', 't'); // mem_crypt blocks
 
 // misc
 constexpr uptr INVALID_ADDR = (uptr)-1;

@@ -2,6 +2,7 @@
 #include "platform/util.h"
 #include "../../shared/svmb_protocol.h"
 
+
 namespace svmb
 {
 
@@ -312,3 +313,4 @@ u32 LogDrain(SVMB_LOG_ENTRY* out, u32 maxEntries, u32* lostTotal)
 }
 
 } // namespace svmb
+

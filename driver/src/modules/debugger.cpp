@@ -22,6 +22,7 @@
 #include "platform/logger.h"
 #include "platform/util.h"
 
+
 namespace
 {
 
@@ -318,3 +319,4 @@ void DebuggerStop()
 SVMB_DEFINE_MODULE(ModuleDebugger, "debugger", 0, DebuggerInit, DebuggerStop)
 
 } // namespace svmb
+

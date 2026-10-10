@@ -7,6 +7,7 @@
 // CPUID passthrough; unrecognized leaves fall through to the core.
 #include "svmb/module_api.h"
 
+
 namespace
 {
 
@@ -53,3 +54,4 @@ namespace svmb
 {
 SVMB_DEFINE_MODULE(ModuleDemoCpuid, "demo_cpuid", 0, DemoInit, DemoStop)
 }
+

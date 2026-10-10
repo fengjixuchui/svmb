@@ -26,6 +26,11 @@ struct Cr3MonConfig
     volatile u64 TargetCr3 = 0;
     char TargetImage[16] = {}; // watch name; written only by the IOCTL gate
     u32 ProcViewId = 0;        // created+filled lazily by the IOCTL gate
+    u32 M4Pid = 0;             // pid that owns the M4 view binding
+                               // (disarm trusts this record, not a
+                               // liveness lookup - a dead target must
+                               // still release the slot, else the next
+                               // run's arm hits DEVICE_BUSY residue)
 };
 Cr3MonConfig g_cfg;
 volatile LONG64 g_readExits = 0;
@@ -1778,6 +1783,97 @@ static void ViewPolicyRefresh()
     }
     Hypervisor::SetPerCoreView(procPml4 ? g_cfg.TargetCr3 : 0,
                                procPml4, base->Pml4Pa());
+}
+
+// resolve a pid's CR3 through the EPROCESS DTB (r83 runtime offsets);
+// the read is guard-prefiltered per the 0x50 law (SafRead64)
+bool Cr3M4PidToCr3(u32 pid, u64* cr3Out) // r133: exported (mem_crypt)
+{
+    PEPROCESS proc = nullptr;
+    if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid,
+                                               &proc)) ||
+        !proc)
+        return false;
+    u64 dtb = 0;
+    bool ok = SafRead64((u64)(ULONG_PTR)proc + Offsets().EprocDtb, &dtb);
+    // r122b diagnosis: read the second CR3-source candidate too (19H1+
+    // EPROCESS.UserDirectoryTableBase @ +0x388; 0 when no KVA shadow).
+    // Logged so one arm run yields the full triple (dtb28 / dtb388 /
+    // the target's runtime CR3 from pidspin's NPT_PROBE stage-5 line).
+    u64 dtbUser = 0;
+    (void)SafRead64((u64)(ULONG_PTR)proc + 0x388, &dtbUser);
+    ObDereferenceObject(proc);
+    if (!ok || (dtb & ~0xFFFull) == 0)
+        return false;
+    SVMB_LOGI("cr3 m4 diag: pid=%u dtb28=%llx dtb388=%llx", pid, dtb,
+              dtbUser);
+    *cr3Out = dtb & ~0xFFFull; // strip PCID/lazy-flush bits if any
+    return true;
+}
+
+NTSTATUS Cr3M4ArmProcessView(u32 pid, u32* viewIdOut)
+{
+    if (viewIdOut)
+        *viewIdOut = 0;
+    NptManager* npt = NptInstance();
+    if (!npt || !npt->NptEnabled() || !npt->Active())
+        return STATUS_INVALID_DEVICE_STATE;
+    u64 cr3 = 0;
+    if (!Cr3M4PidToCr3(pid, &cr3))
+        return STATUS_INVALID_PARAMETER;
+    if (g_cfg.TargetCr3 != 0 && g_cfg.TargetCr3 != cr3)
+    {
+        // r133: a DEAD owner's binding is stealable - its overlays and
+        // crypt records died with the process (exit notify); only the
+        // slot lingers and would DEVICE_BUSY every future arm until
+        // reboot. A live owner still refuses (genuine second target).
+        // (pid-recycling false-negative: an unrelated new process on the
+        // recycled pid pins the slot - operator reboots or arms THAT pid
+        // never; documented, rare, safe.)
+        PEPROCESS old = nullptr;
+        const bool oldAlive =
+            g_cfg.M4Pid
+            && NT_SUCCESS(PsLookupProcessByProcessId(
+                   (HANDLE)(ULONG_PTR)g_cfg.M4Pid, &old))
+            && old;
+        if (oldAlive)
+        {
+            ObDereferenceObject(old);
+            return STATUS_DEVICE_BUSY; // single binding slot owned
+        }
+        SVMB_LOGW("cr3 m4: stealing dead pid=%u binding slot",
+                  g_cfg.M4Pid);
+        g_cfg.TargetCr3 = 0;
+        g_cfg.M4Pid = 0;
+        // fall through: bind the fresh target below
+    }
+    g_cfg.TargetCr3 = cr3;
+    g_cfg.M4Pid = pid;
+    EnsureProcessView();
+    if (!g_cfg.ProcessView || !g_cfg.ProcViewId)
+    {
+        g_cfg.TargetCr3 = 0; // unwind the partial bind
+        return STATUS_UNSUCCESSFUL;
+    }
+    ViewPolicyRefresh();
+    if (viewIdOut)
+        *viewIdOut = g_cfg.ProcViewId;
+    SVMB_LOGI("cr3 m4: process view armed pid=%u cr3=%llx view=%u", pid,
+              cr3, g_cfg.ProcViewId);
+    return STATUS_SUCCESS;
+}
+
+void Cr3M4DisarmProcessView(u32 pid)
+{
+    // trust the arm-time record, not a liveness lookup: a dead target
+    // must still release the binding (a residue here made the NEXT run's
+    // arm fail DEVICE_BUSY - the r120 m4hide err-87 trail)
+    if (g_cfg.TargetCr3 == 0 || g_cfg.M4Pid != pid)
+        return;
+    g_cfg.TargetCr3 = 0;
+    g_cfg.M4Pid = 0;
+    ViewPolicyRefresh(); // cores fall back to the base view
+    SVMB_LOGI("cr3 m4: process view disarmed pid=%u", pid);
 }
 
 void Cr3MonitorConfigure(const SVMB_CR3_CONFIG* cfg)

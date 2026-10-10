@@ -48,9 +48,16 @@ void NpfSetSlideHook(bool (*cb)(void* ctx, NptView& view, u64 gpa4k,
 // it consumed the fault (it has recorded/resolved/re-armed itself); false
 // falls through to the generic deny policy.
 struct GuestContext;
-void NpfSetDenyCallback(bool (*cb)(void* ctx, GuestContext& g, u64 gpa4k, u64 info1,
-                                   u64 currentCr3, u64 rip),
+void NpfSetDenyCallback(bool (*cb)(void* ctx, GuestContext& g, u64 gpa4k,
+                                   u64 info1, u64 currentCr3, u64 rip),
                         void* ctx);
+// r133 slot 2 in the same deny chain (consulted after slot 0 declines):
+// reserved general-purpose seam - currently unregistered (the mem_crypt
+// U/S=0 trap experiment that motivated it was rejected; see
+// docs/MEM_CRYPT.md).
+void NpfSetDenyCallback2(bool (*cb)(void* ctx, GuestContext& g, u64 gpa4k,
+                                    u64 info1, u64 currentCr3, u64 rip),
+                         void* ctx);
 
 // dispatcher handler: register with vmexit::NPF; ud = NptManager*.
 // Returns true when the fault was serviced (re-executed); false declines to

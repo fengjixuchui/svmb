@@ -3,6 +3,7 @@
 #include "platform/logger.h"
 #include "platform/util.h"
 
+
 namespace svmb
 {
 
@@ -379,3 +380,4 @@ void InterceptManager::ApplyAll()
 }
 
 } // namespace svmb
+

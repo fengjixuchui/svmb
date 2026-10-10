@@ -3,6 +3,7 @@
 #include "platform/logger.h"
 #include "platform/util.h"
 
+
 // ---- module registry -------------------------------------------------------
 // To add a module: implement its TU under src/modules/, then add one extern
 // declaration + one entry here. That is the entire integration cost.
@@ -367,3 +368,4 @@ ModuleToken ModuleManager::TokenOf(const char* name) const
 }
 
 } // namespace svmb
+

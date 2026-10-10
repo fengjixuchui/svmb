@@ -3,6 +3,7 @@
 #include "mm/tlb.h"
 #include "platform/logger.h"
 
+
 namespace svmb
 {
 
@@ -44,6 +45,12 @@ void* g_slideCtx = nullptr;
 // r47 sentinel seam (registered via NpfSetDenyCallback, see npf.h)
 bool (*g_denyCb)(void*, GuestContext&, u64, u64, u64, u64) = nullptr;
 void* g_denyCtx = nullptr;
+// r133 second slot in the deny chain: consulted after slot 0 (the
+// load-time region consumer) declines, before the generic spin-breaker
+// resolves the page. Reserved general-purpose seam - currently
+// unregistered (see npf.h).
+bool (*g_denyCb2)(void*, GuestContext&, u64, u64, u64, u64) = nullptr;
+void* g_denyCtx2 = nullptr;
 } // namespace
 
 void NpfSetSlideHook(bool (*cb)(void* ctx, NptView& view, u64 gpa4k,
@@ -60,6 +67,14 @@ void NpfSetDenyCallback(bool (*cb)(void* ctx, GuestContext& g, u64 gpa4k,
 {
     g_denyCb = cb;
     g_denyCtx = ctx;
+}
+
+void NpfSetDenyCallback2(bool (*cb)(void* ctx, GuestContext& g, u64 gpa4k,
+                                    u64 info1, u64 currentCr3, u64 rip),
+                         void* ctx)
+{
+    g_denyCb2 = cb;
+    g_denyCtx2 = ctx;
 }
 
 u32 NpfHealCount()
@@ -163,15 +178,26 @@ bool HandleNpfExit(GuestContext& ctx, void* ud)
 
     // r47 sentinel seam: a module-owned deny consumer takes the fault
     // before the generic spin-breaker tax (records, resolves and re-arms
-    // on its own schedule - zero skipped instructions, one NPF per trip)
-    if (g_denyCb &&
-        (d.Action == NpfAction::DenyWrite || d.Action == NpfAction::DenyExecute ||
-         d.Action == NpfAction::DenyUser) &&
-        g_denyCb(g_denyCtx, ctx, d.Gpa & ~NptView::OFF_4K, ctx.Info1,
-                 ctx.Vmcb()->Save.Cr3, ctx.Regs->Rip))
+    // on its own schedule - zero skipped instructions, one NPF per trip).
+    // r133: two chained slots - the region consumer first, then the
+    // mem_crypt base-view trap; either consuming wins.
+    if ((d.Action == NpfAction::DenyWrite || d.Action == NpfAction::DenyExecute ||
+         d.Action == NpfAction::DenyUser))
     {
-        CrumbPost(CRUMB_NPF_TAIL);
-        return true;
+        if (g_denyCb
+            && g_denyCb(g_denyCtx, ctx, d.Gpa & ~NptView::OFF_4K, ctx.Info1,
+                        ctx.Vmcb()->Save.Cr3, ctx.Regs->Rip))
+        {
+            CrumbPost(CRUMB_NPF_TAIL);
+            return true;
+        }
+        if (g_denyCb2
+            && g_denyCb2(g_denyCtx2, ctx, d.Gpa & ~NptView::OFF_4K,
+                         ctx.Info1, ctx.Vmcb()->Save.Cr3, ctx.Regs->Rip))
+        {
+            CrumbPost(CRUMB_NPF_TAIL);
+            return true;
+        }
     }
 
     // r31 entry diagnostics: first faults only (see MAX_NPF_DIAG)
@@ -314,3 +340,4 @@ bool HandleNpfExit(GuestContext& ctx, void* ud)
 }
 
 } // namespace svmb
+

@@ -59,13 +59,18 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
+      <Optimization>Disabled</Optimization>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <TreatWarningAsError>false</TreatWarningAsError>
       <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)inc;$(ProjectDir)..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>NTDDI_VERSION=NTDDI_WIN10;SVMB_LOG_FORCE_VISIBLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NTDDI_VERSION=NTDDI_WIN10;SVMB_LOG_FORCE_VISIBLE;SVMB_PRODUCTION;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)svmb_$(Configuration).map</MapFileName>
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)svmb_$(Configuration).map</MapFileName>
       <AdditionalDependencies>wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
@@ -125,6 +130,7 @@
     <ClCompile Include="src\modules\debugger.cpp" />
     <ClCompile Include="src\modules\cr3_monitor.cpp" />
     <ClCompile Include="src\modules\mem_read.cpp" />
+    <ClCompile Include="src\modules\mem_crypt.cpp" />
     <ClCompile Include="src\modules\stealth.cpp" />
     <ClCompile Include="src\modules\sysaudit.cpp" />
   </ItemGroup>
@@ -140,6 +146,7 @@
     <ClInclude Include="src\core\npt_probe.h" />
     <ClInclude Include="src\modules\cr3_seed.h" />
     <ClInclude Include="src\modules\mem_read.h" />
+    <ClInclude Include="src\modules\mem_crypt.h" />
     <ClInclude Include="src\modules\stealth.h" />
     <ClInclude Include="src\modules\sysaudit.h" />
     <ClInclude Include="src\modules\dbg_events.h" />

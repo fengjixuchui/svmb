@@ -1,5 +1,6 @@
 #include "modules/dbg_events.h"
 
+
 namespace svmb
 {
 
@@ -73,3 +74,4 @@ u32 DbgEventRing::Count() const
 }
 
 } // namespace svmb
+
